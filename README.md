@@ -1,4 +1,10 @@
-# inspect
+<p align="center">
+  <img src="assets/logo.svg" alt="inspect" width="80" />
+</p>
+
+<p align="center">
+  <strong>inspect</strong>
+</p>
 
 Entity-level code review for Git. Every code review tool today works at the file or line level. inspect works at the entity level: functions, structs, classes, traits. It scores each change by risk and groups them by logical dependency.
 
@@ -213,7 +219,7 @@ Risk levels: **Critical** (>= 0.7), **High** (>= 0.5), **Medium** (>= 0.3), **Lo
 
 ## Languages
 
-Rust, TypeScript, TSX, JavaScript, Python, Go, Java, C, C++, Ruby, C#, Fortran
+TypeScript, TSX, JavaScript, Python, Go, Rust, Java, C, C++, Ruby, C#, PHP, Swift, Kotlin, Elixir, Bash, HCL/Terraform, Fortran, Vue
 
 Powered by tree-sitter parsers from [sem-core](https://github.com/Ataraxy-Labs/sem).
 
