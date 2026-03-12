@@ -307,7 +307,8 @@ export default function KeysPage() {
               </div>
               <button
                 onClick={() => {
-                  const cmd = `curl -X POST https://inspect.ataraxy-labs.com/api/triage \\\n  -H "Authorization: Bearer ${keys[0].prefix}..." \\\n  -H "Content-Type: application/json" \\\n  -d '{"repo":"owner/repo","pr_number":123}'`;
+                  const keyValue = createdKey || `${keys[0].prefix}...`;
+                  const cmd = `curl -X POST https://inspect.ataraxy-labs.com/api/triage \\\n  -H "Authorization: Bearer ${keyValue}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"repo":"owner/repo","pr_number":123}'`;
                   navigator.clipboard.writeText(cmd);
                   setCopiedCmd(true);
                   setTimeout(() => setCopiedCmd(false), 2000);
@@ -331,7 +332,7 @@ export default function KeysPage() {
               <span style={{ color: "var(--accent)" }}>curl</span>
               {" -X POST https://inspect.ataraxy-labs.com/api/triage \\\n"}
               {"  -H \"Authorization: Bearer "}
-              <span style={{ color: "var(--cyan)" }}>{keys[0].prefix}...</span>
+              <span style={{ color: "var(--cyan)" }}>{createdKey || `${keys[0].prefix}...`}</span>
               {"\" \\\n"}
               {"  -H \"Content-Type: application/json\" \\\n"}
               {"  -d '{\"repo\":\"owner/repo\",\"pr_number\":123}'"}

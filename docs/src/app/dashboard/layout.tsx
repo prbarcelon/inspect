@@ -18,7 +18,7 @@ export default function DashboardLayout({
       >
         <div
           style={{
-            maxWidth: 800,
+            maxWidth: 1000,
             margin: "0 auto",
             display: "flex",
             alignItems: "center",
@@ -68,7 +68,7 @@ export default function DashboardLayout({
           <UserButton />
         </div>
       </nav>
-      <main style={{ maxWidth: 800, margin: "0 auto", padding: "40px 24px" }}>
+      <main style={{ maxWidth: 1000, margin: "0 auto", padding: "40px 24px" }}>
         {children}
       </main>
     </div>
