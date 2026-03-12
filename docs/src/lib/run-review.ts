@@ -1,5 +1,5 @@
 import { fetchPr, fetchPrDiff, isNoiseFile, PrInfo } from "./github";
-import { Finding, reviewDeepV2 } from "./openai";
+import { Finding, reviewV26, fetchTriage } from "./openai";
 
 export interface ReviewResult {
   pr: {
@@ -15,6 +15,7 @@ export interface ReviewResult {
     total_findings: number;
     files_analyzed: number;
     files_skipped: number;
+    entity_triage: boolean;
   };
   timing: {
     triage_ms: number;
@@ -29,7 +30,9 @@ export async function runReview(
 ): Promise<ReviewResult> {
   const openaiKey = process.env.OPENAI_API_KEY;
   const githubToken = process.env.GITHUB_TOKEN;
-  const model = process.env.OPENAI_MODEL || "gpt-4o";
+  const model = process.env.OPENAI_MODEL || "gpt-5.2";
+  const inspectApiUrl = (process.env.INSPECT_API_URL || "").replace(/"/g, "");
+  const inspectApiKey = (process.env.INSPECT_API_KEY || "").replace(/"/g, "");
 
   if (!openaiKey || !githubToken) {
     throw new Error("Server missing OPENAI_API_KEY or GITHUB_TOKEN");
@@ -37,16 +40,20 @@ export async function runReview(
 
   const start = Date.now();
 
-  const [pr, diff] = await Promise.all([
+  // Fetch PR metadata, diff, and entity triage in parallel
+  const [pr, diff, triage] = await Promise.all([
     fetchPr(githubToken, repo, prNumber),
     fetchPrDiff(githubToken, repo, prNumber),
+    inspectApiUrl && inspectApiKey
+      ? fetchTriage(inspectApiKey, inspectApiUrl, repo, prNumber)
+      : Promise.resolve(""),
   ]);
 
   const triageMs = Date.now() - start;
   const visibleFiles = pr.files.filter((f) => !isNoiseFile(f.filename));
 
   const reviewStart = Date.now();
-  const findings = await reviewDeepV2(openaiKey, model, pr.title, diff, 15);
+  const findings = await reviewV26(openaiKey, model, pr.title, diff, triage);
   const reviewMs = Date.now() - reviewStart;
   const totalMs = Date.now() - start;
 
@@ -64,6 +71,7 @@ export async function runReview(
       total_findings: findings.length,
       files_analyzed: visibleFiles.length,
       files_skipped: pr.files.length - visibleFiles.length,
+      entity_triage: triage ? true : false,
     },
     timing: {
       triage_ms: triageMs,

@@ -3,7 +3,7 @@ import { validateApiKey } from "@/lib/validate-key";
 import { runReview } from "@/lib/run-review";
 import { getSupabase } from "@/lib/supabase";
 
-export const maxDuration = 60;
+export const maxDuration = 300;
 
 export async function POST(req: NextRequest) {
   const keyResult = await validateApiKey(req);
