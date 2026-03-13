@@ -185,7 +185,8 @@ fn build_entity_json(
             }
         })
         .map(|r| {
-            serde_json::json!({
+            let is_cosmetic = r.structural_change == Some(false);
+            let mut obj = serde_json::json!({
                 "name": r.entity_name,
                 "type": r.entity_type,
                 "file": r.file_path,
@@ -194,9 +195,45 @@ fn build_entity_json(
                 "classification": format!("{}", r.classification),
                 "change_type": format!("{:?}", r.change_type).to_lowercase(),
                 "public_api": r.is_public_api,
-                "cosmetic": r.structural_change == Some(false),
+                "cosmetic": is_cosmetic,
                 "group_id": r.group_id,
-            })
+                "blast_radius": r.blast_radius,
+                "dependent_count": r.dependent_count,
+                "dependency_count": r.dependency_count,
+            });
+
+            // Add content fields for non-cosmetic entities (capped at 2000 chars)
+            if !is_cosmetic {
+                if let Some(ref content) = r.before_content {
+                    let capped: String = content.chars().take(2000).collect();
+                    obj["before_content"] = serde_json::Value::String(capped);
+                }
+                if let Some(ref content) = r.after_content {
+                    let capped: String = content.chars().take(2000).collect();
+                    obj["after_content"] = serde_json::Value::String(capped);
+                }
+            }
+
+            // Add dependency info (capped at 10 each)
+            let dependents: Vec<serde_json::Value> = r.dependent_names
+                .iter()
+                .take(10)
+                .map(|(name, file)| serde_json::json!({"name": name, "file": file}))
+                .collect();
+            if !dependents.is_empty() {
+                obj["dependents"] = serde_json::Value::Array(dependents);
+            }
+
+            let dependencies: Vec<serde_json::Value> = r.dependency_names
+                .iter()
+                .take(10)
+                .map(|(name, file)| serde_json::json!({"name": name, "file": file}))
+                .collect();
+            if !dependencies.is_empty() {
+                obj["dependencies"] = serde_json::Value::Array(dependencies);
+            }
+
+            obj
         })
         .collect()
 }
