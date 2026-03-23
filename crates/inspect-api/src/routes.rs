@@ -309,11 +309,11 @@ async fn run_review(state: Arc<AppState>, job_id: String) {
         }
     };
 
-    // Build triage context
-    let triage_section = prompts::build_rich_triage(&result.entity_reviews);
+    // Build triage context with entity code snippets
+    let triage_section = prompts::build_code_triage(&result.entity_reviews);
 
-    // Step 3: LLM review with deep_v2 strategy
-    let findings = openai::review_deep_v2(&state, &pr.title, &diff, &triage_section, 15).await;
+    // Step 3: LLM review with hybrid_v10 strategy (9 lenses + validation)
+    let findings = openai::review_hybrid_v10(&state, &pr.title, &diff, &triage_section, 7).await;
     let review_ms = review_start.elapsed().as_millis() as u64;
     info!("Review complete in {}ms: {} findings", review_ms, findings.len());
 

@@ -31,7 +31,7 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
     let openai_model =
-        std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
+        std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.2".to_string());
     let supabase_url = std::env::var("SUPABASE_URL").expect("SUPABASE_URL required");
     let supabase_key =
         std::env::var("SUPABASE_SERVICE_ROLE_KEY").expect("SUPABASE_SERVICE_ROLE_KEY required");

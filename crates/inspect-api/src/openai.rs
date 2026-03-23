@@ -42,8 +42,9 @@ async fn call_openai(
     system: &str,
     prompt: &str,
     temperature: f64,
+    seed: Option<u64>,
 ) -> Result<String, String> {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": state.openai_model,
         "messages": [
             {"role": "system", "content": system},
@@ -51,6 +52,9 @@ async fn call_openai(
         ],
         "temperature": temperature,
     });
+    if let Some(s) = seed {
+        body["seed"] = serde_json::json!(s);
+    }
 
     let resp = state
         .http
@@ -138,75 +142,66 @@ fn strip_code_fences(text: &str) -> String {
     trimmed.to_string()
 }
 
-/// Two-temperature merge + validation (deep_v2 strategy).
-pub async fn review_deep_v2(
-    state: &AppState,
-    pr_title: &str,
-    diff: &str,
-    triage_section: &str,
-    max_findings: usize,
-) -> Vec<Finding> {
-    let truncated = prompts::truncate_diff(diff, 80_000);
-    let prompt = prompts::format_deep_prompt(pr_title, triage_section, &truncated);
-
-    // Two passes in parallel: T=0 (deterministic) + T=0.3 (diverse)
-    let (pass_0, pass_1) = tokio::join!(
-        call_openai(state, prompts::SYSTEM_REVIEW, &prompt, 0.0),
-        call_openai(state, prompts::SYSTEM_REVIEW, &prompt, 0.3),
-    );
-
-    let mut all_findings: Vec<Finding> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // Merge T=0 results
-    if let Ok(text) = pass_0 {
-        for f in parse_issues(&text) {
-            let key = f.issue.to_lowercase().chars().take(80).collect::<String>();
-            if seen.insert(key) {
-                all_findings.push(f);
+/// Extract file paths and basenames from a unified diff.
+fn extract_diff_files(diff: &str) -> std::collections::HashSet<String> {
+    let mut files = std::collections::HashSet::new();
+    for line in diff.lines() {
+        if line.starts_with("+++ b/") || line.starts_with("--- a/") {
+            let path = &line[6..];
+            if path != "/dev/null" && !path.is_empty() {
+                files.insert(path.to_string());
+                if let Some(basename) = path.rsplit('/').next() {
+                    files.insert(basename.to_string());
+                }
             }
         }
-    } else {
-        warn!("T=0 pass failed: {:?}", pass_0.err());
     }
-
-    // Add unique from T=0.3
-    if let Ok(text) = pass_1 {
-        for f in parse_issues(&text) {
-            let key = f.issue.to_lowercase().chars().take(80).collect::<String>();
-            if seen.insert(key) {
-                all_findings.push(f);
-            }
-        }
-    } else {
-        warn!("T=0.3 pass failed: {:?}", pass_1.err());
-    }
-
-    if all_findings.is_empty() {
-        return Vec::new();
-    }
-
-    // Skip validation if few findings
-    if all_findings.len() <= 2 {
-        return all_findings;
-    }
-
-    // Validation pass
-    match validate_findings(state, pr_title, &truncated, &all_findings).await {
-        Ok(validated) => validated.into_iter().take(max_findings).collect(),
-        Err(e) => {
-            warn!("Validation failed: {e}");
-            all_findings.into_iter().take(max_findings).collect()
-        }
-    }
+    files
 }
 
-/// Diff-aware self-refine validation.
-async fn validate_findings(
+const CODE_EXTENSIONS: &[&str] = &[
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".rb",
+    ".c", ".cpp", ".cs", ".swift", ".kt", ".scala", ".hbs", ".erb",
+    ".ex", ".exs", ".hcl",
+];
+
+/// Drop findings that reference code files not present in the diff.
+fn structural_file_filter(
+    findings: Vec<Finding>,
+    diff_files: &std::collections::HashSet<String>,
+) -> Vec<Finding> {
+    if diff_files.is_empty() {
+        return findings;
+    }
+    let lower_basenames: std::collections::HashSet<String> = diff_files
+        .iter()
+        .map(|f| f.rsplit('/').next().unwrap_or(f).to_lowercase())
+        .collect();
+
+    findings
+        .into_iter()
+        .filter(|f| {
+            let text = f.issue.to_lowercase();
+            for word in text.replace('/', " / ").split_whitespace() {
+                if CODE_EXTENSIONS.iter().any(|ext| word.ends_with(ext)) {
+                    let base = word.rsplit('/').next().unwrap_or(word);
+                    if !lower_basenames.contains(base) {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+/// Validation with seed support.
+async fn validate_findings_seeded(
     state: &AppState,
     pr_title: &str,
     diff: &str,
     candidates: &[Finding],
+    seed: Option<u64>,
 ) -> Result<Vec<Finding>, String> {
     let candidates_text: String = candidates
         .iter()
@@ -222,8 +217,86 @@ async fn validate_findings(
         .join("\n");
 
     let prompt = prompts::format_validate_prompt(pr_title, diff, &candidates_text);
-    let text = call_openai(state, prompts::SYSTEM_VALIDATE, &prompt, 0.0).await?;
+    let text = call_openai(state, prompts::SYSTEM_VALIDATE, &prompt, 0.0, seed).await?;
     Ok(parse_issues(&text))
+}
+
+/// Hybrid v10 strategy: 9 parallel lenses + structural filter + validation.
+pub async fn review_hybrid_v10(
+    state: &AppState,
+    pr_title: &str,
+    diff: &str,
+    triage_section: &str,
+    max_findings: usize,
+) -> Vec<Finding> {
+    let truncated = prompts::truncate_diff(diff, 65_000);
+    let diff_files = extract_diff_files(diff);
+
+    // Build 6 specialized lens prompts
+    let p_data = prompts::format_lens_prompt(prompts::PROMPT_LENS_DATA, pr_title, triage_section, &truncated);
+    let p_conc = prompts::format_lens_prompt(prompts::PROMPT_LENS_CONCURRENCY, pr_title, triage_section, &truncated);
+    let p_cont = prompts::format_lens_prompt(prompts::PROMPT_LENS_CONTRACTS, pr_title, triage_section, &truncated);
+    let p_sec = prompts::format_lens_prompt(prompts::PROMPT_LENS_SECURITY, pr_title, triage_section, &truncated);
+    let p_typo = prompts::format_lens_prompt(prompts::PROMPT_LENS_TYPOS, pr_title, triage_section, &truncated);
+    let p_rt = prompts::format_lens_prompt(prompts::PROMPT_LENS_RUNTIME, pr_title, triage_section, &truncated);
+
+    // 3 general lens prompts
+    let p_gen = prompts::format_deep_prompt(pr_title, triage_section, &truncated);
+
+    // 9 lenses in parallel
+    let (r1, r2, r3, r4, r5, r6, r7, r8, r9) = tokio::join!(
+        call_openai(state, prompts::SYSTEM_DATA, &p_data, 0.0, Some(42)),
+        call_openai(state, prompts::SYSTEM_CONCURRENCY, &p_conc, 0.0, Some(42)),
+        call_openai(state, prompts::SYSTEM_CONTRACTS, &p_cont, 0.0, Some(42)),
+        call_openai(state, prompts::SYSTEM_SECURITY, &p_sec, 0.0, Some(42)),
+        call_openai(state, prompts::SYSTEM_TYPOS, &p_typo, 0.0, Some(42)),
+        call_openai(state, prompts::SYSTEM_RUNTIME, &p_rt, 0.0, Some(42)),
+        call_openai(state, prompts::SYSTEM_REVIEW, &p_gen, 0.0, Some(42)),
+        call_openai(state, prompts::SYSTEM_REVIEW, &p_gen, 0.1, Some(42)),
+        call_openai(state, prompts::SYSTEM_REVIEW, &p_gen, 0.1, Some(123)),
+    );
+
+    // Merge + dedup
+    let mut all_findings: Vec<Finding> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for result in [r1, r2, r3, r4, r5, r6, r7, r8, r9] {
+        if let Ok(text) = result {
+            for f in parse_issues(&text) {
+                let key: String = f.issue.to_lowercase().chars().take(80).collect();
+                if seen.insert(key) {
+                    all_findings.push(f);
+                }
+            }
+        } else {
+            warn!("Lens failed: {:?}", result.err());
+        }
+    }
+
+    if all_findings.is_empty() {
+        return Vec::new();
+    }
+
+    // Structural file filter
+    all_findings = structural_file_filter(all_findings, &diff_files);
+
+    if all_findings.is_empty() {
+        return Vec::new();
+    }
+
+    // Skip validation if few findings
+    if all_findings.len() <= 2 {
+        return all_findings;
+    }
+
+    // Validation pass with seed=42
+    match validate_findings_seeded(state, pr_title, &truncated, &all_findings, Some(42)).await {
+        Ok(validated) => validated.into_iter().take(max_findings).collect(),
+        Err(e) => {
+            warn!("Validation failed: {e}");
+            all_findings.into_iter().take(max_findings).collect()
+        }
+    }
 }
 
 #[cfg(test)]

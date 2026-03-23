@@ -5,6 +5,97 @@ pub const SYSTEM_REVIEW: &str = "You are a precise code reviewer. Only report re
 
 pub const SYSTEM_VALIDATE: &str = "You are a precise reviewer. Verify each issue against the actual diff. Only keep confirmed bugs. Always respond with valid JSON.";
 
+// Specialized lens system prompts
+pub const SYSTEM_DATA: &str = "You are a data correctness reviewer. Always respond with valid JSON.";
+pub const SYSTEM_CONCURRENCY: &str = "You are a concurrency/state bug reviewer. Always respond with valid JSON.";
+pub const SYSTEM_CONTRACTS: &str = "You are an API contracts reviewer. Always respond with valid JSON.";
+pub const SYSTEM_SECURITY: &str = "You are a security reviewer. Always respond with valid JSON.";
+pub const SYSTEM_TYPOS: &str = "You are a character-level detail reviewer. Always respond with valid JSON.";
+pub const SYSTEM_RUNTIME: &str = "You are a runtime failure analyst. Always respond with valid JSON.";
+
+pub const PROMPT_LENS_DATA: &str = r#"You are a code reviewer specializing in DATA CORRECTNESS issues.
+
+PR Title: {pr_title}
+{triage_section}
+PR Diff:
+{diff}
+
+Focus ONLY on: wrong translations, wrong constants/mappings/enum values, copy-paste errors, wrong key/field references, case sensitivity in comparisons, incorrect regex.
+Rules: ONLY concrete data issues. Be specific. Max 5 issues.
+Respond with ONLY: {{"issues": [{{"issue": "desc", "evidence": "code"}}]}}"#;
+
+pub const PROMPT_LENS_CONCURRENCY: &str = r#"You are a code reviewer specializing in CONCURRENCY and STATE bugs.
+
+PR Title: {pr_title}
+{triage_section}
+PR Diff:
+{diff}
+
+Focus ONLY on: race conditions, missing locks/transactions, stale reads, process lifecycle bugs, cache inconsistency, feature flag inconsistency.
+Rules: ONLY issues with evidence in the diff. Be specific. Max 5 issues.
+Respond with ONLY: {{"issues": [{{"issue": "desc", "evidence": "code"}}]}}"#;
+
+pub const PROMPT_LENS_CONTRACTS: &str = r#"You are a code reviewer specializing in API CONTRACT violations.
+
+PR Title: {pr_title}
+{triage_section}
+PR Diff:
+{diff}
+
+Focus ONLY on: missing abstract method implementations, wrong signatures/types, API breaking changes, wrong parameter order, key mismatches, missing React keys, import errors, method name typos breaking interfaces.
+Rules: ONLY verifiable issues. Be specific. Max 5 issues.
+Respond with ONLY: {{"issues": [{{"issue": "desc", "evidence": "code"}}]}}"#;
+
+pub const PROMPT_LENS_SECURITY: &str = r#"You are a security-focused code reviewer.
+
+PR Title: {pr_title}
+{triage_section}
+PR Diff:
+{diff}
+
+Focus ONLY on: SSRF, XSS, injection, auth bypass, origin/referrer bypass, case sensitivity bypass in security comparisons, frame options misconfig, hardcoded secrets.
+Rules: ONLY real exploitable vulnerabilities. Be specific. Max 5 issues.
+Respond with ONLY: {{"issues": [{{"issue": "desc", "evidence": "code"}}]}}"#;
+
+pub const PROMPT_LENS_TYPOS: &str = r#"You are a code reviewer with exceptional attention to character-level detail.
+
+PR Title: {pr_title}
+{triage_section}
+PR Diff:
+{diff}
+
+Focus ONLY on:
+- Method/function/variable name TYPOS causing runtime errors
+- Wrong language in locale/translation files
+- Missing required method suffixes (Rails '?', etc.)
+- Case sensitivity bugs in comparisons
+- Wrong vendor prefixes
+- Property/key name mismatches
+
+Rules: Character-level precision. Only if it causes runtime failure. Max 5 issues.
+Respond with ONLY: {{"issues": [{{"issue": "desc", "evidence": "code"}}]}}"#;
+
+pub const PROMPT_LENS_RUNTIME: &str = r#"You are a code reviewer focused on RUNTIME FAILURES.
+
+PR Title: {pr_title}
+{triage_section}
+PR Diff:
+{diff}
+
+For each changed function/class, ask: "What would happen if I ran this code?"
+
+Focus ONLY on:
+- Null/nil/undefined dereference
+- Missing abstract method implementations causing TypeError
+- Unreachable code branches
+- Infinite recursion without termination
+- Wrong error messages
+- Panic on nil in Go
+- Missing React keys
+
+Rules: RUNTIME behavior only. Only actual failures. Max 5 issues.
+Respond with ONLY: {{"issues": [{{"issue": "desc", "evidence": "code"}}]}}"#;
+
 pub const PROMPT_DEEP: &str = r#"You are a world-class code reviewer. Review this PR and find ONLY real, concrete bugs.
 
 PR Title: {pr_title}
@@ -202,4 +293,143 @@ pub fn format_validate_prompt(pr_title: &str, diff: &str, candidates: &str) -> S
         .replace("{pr_title}", pr_title)
         .replace("{diff}", diff)
         .replace("{candidates}", candidates)
+}
+
+/// Format a lens prompt template with actual values.
+pub fn format_lens_prompt(template: &str, pr_title: &str, triage_section: &str, diff: &str) -> String {
+    template
+        .replace("{pr_title}", pr_title)
+        .replace("{triage_section}", triage_section)
+        .replace("{diff}", diff)
+}
+
+/// Score an entity for triage ranking (matches Python entity_triage_score).
+pub fn entity_triage_score(e: &EntityReview) -> f64 {
+    let mut score = e.risk_score;
+    score += (e.blast_radius.min(20) as f64) * 0.02;
+    if e.is_public_api {
+        score += 0.4;
+    }
+    match e.entity_type.as_str() {
+        "class" | "method" | "function" | "interface" | "constructor" | "export" => score += 0.4,
+        "field" => score += 0.2,
+        "property" | "chunk" | "heading" => score -= 0.3,
+        _ => {}
+    }
+    if matches!(e.change_type, ChangeType::Modified) {
+        score += 0.15;
+    }
+    score += (e.dependent_count.min(10) as f64) * 0.03;
+    let code_len = e.after_content.as_ref()
+        .or(e.before_content.as_ref())
+        .map(|s| s.len())
+        .unwrap_or(0);
+    score += (code_len.min(3000) as f64) * 0.0001;
+    score
+}
+
+/// Build triage with BEFORE/AFTER code for top entities.
+/// Top 10 get code snippets (800 chars each, 15K budget). Next 15 get names only.
+pub fn build_code_triage(entities: &[EntityReview]) -> String {
+    if entities.is_empty() {
+        return String::new();
+    }
+
+    let mut meaningful: Vec<&EntityReview> = entities
+        .iter()
+        .filter(|e| matches!(e.change_type, ChangeType::Modified | ChangeType::Added | ChangeType::Deleted))
+        .collect();
+
+    meaningful.sort_by(|a, b| {
+        entity_triage_score(b)
+            .partial_cmp(&entity_triage_score(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if meaningful.is_empty() {
+        return build_rich_triage(entities);
+    }
+
+    let mut lines = vec!["## High-risk entities (review these carefully):".to_string()];
+    let mut chars_used = 0usize;
+    let code_budget = 15_000usize;
+
+    let code_entities = &meaningful[..meaningful.len().min(10)];
+    let name_entities = if meaningful.len() > 10 {
+        &meaningful[10..meaningful.len().min(25)]
+    } else {
+        &[]
+    };
+
+    for e in code_entities {
+        let mut header = format!(
+            "\n### `{}` ({}, {:?}) in {}",
+            e.entity_name, e.entity_type, e.change_type, e.file_path
+        );
+        let mut tags = Vec::new();
+        if e.is_public_api {
+            tags.push("PUBLIC_API".to_string());
+        }
+        if e.blast_radius >= 3 {
+            tags.push(format!("blast={}", e.blast_radius));
+        }
+        if e.dependent_count >= 2 {
+            let top_deps: Vec<&str> = e.dependent_names.iter().take(3).map(|(n, _)| n.as_str()).collect();
+            if !top_deps.is_empty() {
+                tags.push(format!("used_by={}", top_deps.join(",")));
+            } else {
+                tags.push(format!("used_by={}", e.dependent_count));
+            }
+        }
+        if !tags.is_empty() {
+            header.push_str(&format!(" [{}]", tags.join(", ")));
+        }
+        lines.push(header);
+
+        let before: String = e.before_content.as_ref().map(|s| s.chars().take(800).collect()).unwrap_or_default();
+        let after: String = e.after_content.as_ref().map(|s| s.chars().take(800).collect()).unwrap_or_default();
+
+        let snippet = if !before.is_empty() && !after.is_empty() {
+            format!("BEFORE:\n```\n{before}\n```\nAFTER:\n```\n{after}\n```")
+        } else if !after.is_empty() {
+            format!("NEW CODE:\n```\n{after}\n```")
+        } else if !before.is_empty() {
+            format!("DELETED CODE:\n```\n{before}\n```")
+        } else {
+            String::new()
+        };
+
+        if !snippet.is_empty() && chars_used + snippet.len() < code_budget {
+            chars_used += snippet.len();
+            lines.push(snippet);
+        }
+    }
+
+    if !name_entities.is_empty() {
+        lines.push("\n## Other changed entities:".to_string());
+        let mut by_file: std::collections::HashMap<&str, Vec<&EntityReview>> =
+            std::collections::HashMap::new();
+        for e in name_entities {
+            by_file.entry(e.file_path.as_str()).or_default().push(e);
+        }
+        let mut file_entries: Vec<(&str, Vec<&EntityReview>)> = by_file.into_iter().collect();
+        file_entries.sort_by(|a, b| {
+            let a_max = a.1.iter().map(|e| entity_triage_score(e)).fold(0.0_f64, f64::max);
+            let b_max = b.1.iter().map(|e| entity_triage_score(e)).fold(0.0_f64, f64::max);
+            b_max.partial_cmp(&a_max).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (fp, mut ents) in file_entries {
+            lines.push(format!("\n**{fp}**:"));
+            ents.sort_by(|a, b| {
+                entity_triage_score(b)
+                    .partial_cmp(&entity_triage_score(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for e in ents {
+                lines.push(format!("  - {} ({}, {:?})", e.entity_name, e.entity_type, e.change_type));
+            }
+        }
+    }
+
+    lines.join("\n")
 }
