@@ -15,6 +15,8 @@ pub struct AppState {
     pub github_token: String,
     pub http: reqwest::Client,
     pub jobs: Arc<RwLock<HashMap<String, ReviewJob>>>,
+    pub anthropic_api_key: Option<String>,
+    pub anthropic_model: String,
     pub supabase_url: String,
     pub supabase_key: String,
 }
@@ -35,6 +37,8 @@ pub struct ReviewJob {
     pub status: JobStatus,
     pub repo: String,
     pub pr_number: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<ReviewResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -62,4 +66,8 @@ pub struct TimingInfo {
     pub triage_ms: u64,
     pub review_ms: u64,
     pub total_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_iterations: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_tool_calls: Option<usize>,
 }

@@ -875,6 +875,7 @@ name = "inspect-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "chrono",
  "inspect-core",
  "reqwest",
@@ -886,6 +887,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
  "uuid",
 ]
 

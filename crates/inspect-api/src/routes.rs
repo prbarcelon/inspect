@@ -23,6 +23,7 @@ use crate::state::*;
 pub struct ReviewRequest {
     pub repo: String,
     pub pr_number: u64,
+    pub strategy: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +46,7 @@ pub async fn create_review(
         status: JobStatus::Pending,
         repo: req.repo.clone(),
         pr_number: req.pr_number,
+        strategy: req.strategy.clone(),
         result: None,
         error: None,
         created_at: chrono::Utc::now(),
@@ -255,10 +257,10 @@ async fn run_review(state: Arc<AppState>, job_id: String) {
         }
     };
 
-    let (repo, pr_number) = {
+    let (repo, pr_number, strategy) = {
         let jobs = state.jobs.read().await;
         let job = jobs.get(&job_id).unwrap();
-        (job.repo.clone(), job.pr_number)
+        (job.repo.clone(), job.pr_number, job.strategy.clone())
     };
 
     let pr = match client.get_pr(&repo, pr_number).await {
@@ -312,8 +314,209 @@ async fn run_review(state: Arc<AppState>, job_id: String) {
     // Build triage context with entity code snippets
     let triage_section = prompts::build_code_triage(&result.entity_reviews);
 
-    // Step 3: LLM review with hybrid_v10 strategy (9 lenses + validation)
-    let findings = openai::review_hybrid_v10(&state, &pr.title, &diff, &triage_section, 7).await;
+    // Step 3: LLM review
+    let (findings, agent_iterations, agent_tool_calls) = match strategy.as_deref() {
+        Some("agentic_v2") => {
+            info!("Using agentic_v2 strategy");
+            let ctx = openai::AgentContext {
+                entity_reviews: result.entity_reviews.clone(),
+                repo: repo.clone(),
+                base_sha: pr.base_sha.clone(),
+                head_sha: pr.head_sha.clone(),
+                pr_title: pr.title.clone(),
+                diff: diff.clone(),
+                triage_section: triage_section.clone(),
+            };
+            let (findings, iters, calls) = openai::review_agentic_v2(&state, &ctx).await;
+            (findings, Some(iters), Some(calls))
+        }
+        Some("hybrid_v11") => {
+            info!("Using hybrid_v11 strategy (9 lenses + agent)");
+            let ctx = openai::AgentContext {
+                entity_reviews: result.entity_reviews.clone(),
+                repo: repo.clone(),
+                base_sha: pr.base_sha.clone(),
+                head_sha: pr.head_sha.clone(),
+                pr_title: pr.title.clone(),
+                diff: diff.clone(),
+                triage_section: triage_section.clone(),
+            };
+            let (findings, iters, calls) =
+                openai::review_hybrid_v11(&state, &pr.title, &diff, &triage_section, 7, &ctx).await;
+            (findings, Some(iters), Some(calls))
+        }
+        Some("hybrid_v12") => {
+            info!("Using hybrid_v12 strategy (9 lenses + agentic validation)");
+            let ctx = openai::AgentContext {
+                entity_reviews: result.entity_reviews.clone(),
+                repo: repo.clone(),
+                base_sha: pr.base_sha.clone(),
+                head_sha: pr.head_sha.clone(),
+                pr_title: pr.title.clone(),
+                diff: diff.clone(),
+                triage_section: triage_section.clone(),
+            };
+            let (findings, iters, calls) =
+                openai::review_hybrid_v12(&state, &pr.title, &diff, &triage_section, 7, &ctx).await;
+            (findings, Some(iters), Some(calls))
+        }
+        Some("hybrid_v13") => {
+            info!("Using hybrid_v13 strategy (9 lenses + blind validation + agent rescue)");
+            let ctx = openai::AgentContext {
+                entity_reviews: result.entity_reviews.clone(),
+                repo: repo.clone(),
+                base_sha: pr.base_sha.clone(),
+                head_sha: pr.head_sha.clone(),
+                pr_title: pr.title.clone(),
+                diff: diff.clone(),
+                triage_section: triage_section.clone(),
+            };
+            let (findings, iters, calls) =
+                openai::review_hybrid_v13(&state, &pr.title, &diff, &triage_section, 7, &ctx).await;
+            (findings, Some(iters), Some(calls))
+        }
+        Some("hybrid_v23") => {
+            info!("Using hybrid_v23 strategy (2x validator union + agentic challenge)");
+            let ctx = openai::AgentContext {
+                entity_reviews: result.entity_reviews.clone(),
+                repo: repo.clone(),
+                base_sha: pr.base_sha.clone(),
+                head_sha: pr.head_sha.clone(),
+                pr_title: pr.title.clone(),
+                diff: diff.clone(),
+                triage_section: triage_section.clone(),
+            };
+            let (findings, iters, calls) =
+                openai::review_hybrid_v23(&state, &pr.title, &diff, &triage_section, 7, &ctx).await;
+            (findings, Some(iters), Some(calls))
+        }
+        Some("hybrid_v24") => {
+            info!("Using hybrid_v24 strategy (GPT-5.4 + Sonnet 4.6 cross-model validation + agentic challenge)");
+            let ctx = openai::AgentContext {
+                entity_reviews: result.entity_reviews.clone(),
+                repo: repo.clone(),
+                base_sha: pr.base_sha.clone(),
+                head_sha: pr.head_sha.clone(),
+                pr_title: pr.title.clone(),
+                diff: diff.clone(),
+                triage_section: triage_section.clone(),
+            };
+            let (findings, iters, calls) =
+                openai::review_hybrid_v24(&state, &pr.title, &diff, &triage_section, 7, &ctx).await;
+            (findings, Some(iters), Some(calls))
+        }
+        Some("hybrid_v22") => {
+            info!("Using hybrid_v22 strategy (raw lenses + agentic challenge, no blind validator)");
+            let ctx = openai::AgentContext {
+                entity_reviews: result.entity_reviews.clone(),
+                repo: repo.clone(),
+                base_sha: pr.base_sha.clone(),
+                head_sha: pr.head_sha.clone(),
+                pr_title: pr.title.clone(),
+                diff: diff.clone(),
+                triage_section: triage_section.clone(),
+            };
+            let (findings, iters, calls) =
+                openai::review_hybrid_v22(&state, &pr.title, &diff, &triage_section, 7, &ctx).await;
+            (findings, Some(iters), Some(calls))
+        }
+        Some("raw_lenses") => {
+            info!("Using raw_lenses strategy (no validation, no challenge)");
+            let findings =
+                openai::review_raw_lenses(&state, &pr.title, &diff, &triage_section, 50).await;
+            (findings, None, None)
+        }
+        Some("hybrid_v21") => {
+            info!("Using hybrid_v21 strategy (lenient v16 validator + agentic challenge)");
+            let ctx = openai::AgentContext {
+                entity_reviews: result.entity_reviews.clone(),
+                repo: repo.clone(),
+                base_sha: pr.base_sha.clone(),
+                head_sha: pr.head_sha.clone(),
+                pr_title: pr.title.clone(),
+                diff: diff.clone(),
+                triage_section: triage_section.clone(),
+            };
+            let (findings, iters, calls) =
+                openai::review_hybrid_v21(&state, &pr.title, &diff, &triage_section, 7, &ctx).await;
+            (findings, Some(iters), Some(calls))
+        }
+        Some("hybrid_v20") => {
+            info!("Using hybrid_v20 strategy (v10 + agentic challenge with tools)");
+            let ctx = openai::AgentContext {
+                entity_reviews: result.entity_reviews.clone(),
+                repo: repo.clone(),
+                base_sha: pr.base_sha.clone(),
+                head_sha: pr.head_sha.clone(),
+                pr_title: pr.title.clone(),
+                diff: diff.clone(),
+                triage_section: triage_section.clone(),
+            };
+            let (findings, iters, calls) =
+                openai::review_hybrid_v20(&state, &pr.title, &diff, &triage_section, 7, &ctx).await;
+            (findings, Some(iters), Some(calls))
+        }
+        Some("hybrid_v19") => {
+            info!("Using hybrid_v19 strategy (v10 + challenger second pass)");
+            let findings =
+                openai::review_hybrid_v19(&state, &pr.title, &diff, &triage_section, 7).await;
+            (findings, None, None)
+        }
+        Some("hybrid_v18") => {
+            info!("Using hybrid_v18 strategy (cross-model: GPT validate + Claude validate)");
+            let findings =
+                openai::review_hybrid_v18(&state, &pr.title, &diff, &triage_section, 7).await;
+            (findings, None, None)
+        }
+        Some("hybrid_v17") => {
+            info!("Using hybrid_v17 strategy (agreement threshold: drop 1/9, validate 2/9, keep 3+/9)");
+            let findings =
+                openai::review_hybrid_v17(&state, &pr.title, &diff, &triage_section, 7).await;
+            (findings, None, None)
+        }
+        Some("hybrid_v16") => {
+            info!("Using hybrid_v16 strategy (9 lenses + enriched blind validation)");
+            let findings =
+                openai::review_hybrid_v16(&state, &pr.title, &diff, &triage_section, 7, &result.entity_reviews).await;
+            (findings, None, None)
+        }
+        Some("hybrid_v15") => {
+            info!("Using hybrid_v15 strategy (9 lenses intersection + blind validation)");
+            let findings =
+                openai::review_hybrid_v15(&state, &pr.title, &diff, &triage_section, 7).await;
+            (findings, None, None)
+        }
+        Some("hybrid_v14") => {
+            info!("Using hybrid_v14 strategy (9 lenses + blind validation + agent evidence + revalidation)");
+            let ctx = openai::AgentContext {
+                entity_reviews: result.entity_reviews.clone(),
+                repo: repo.clone(),
+                base_sha: pr.base_sha.clone(),
+                head_sha: pr.head_sha.clone(),
+                pr_title: pr.title.clone(),
+                diff: diff.clone(),
+                triage_section: triage_section.clone(),
+            };
+            let (findings, iters, calls) =
+                openai::review_hybrid_v14(&state, &pr.title, &diff, &triage_section, 7, &ctx).await;
+            (findings, Some(iters), Some(calls))
+        }
+        _ => {
+            info!("Using default strategy (hybrid_v20: v10 + agentic challenge)");
+            let ctx = openai::AgentContext {
+                entity_reviews: result.entity_reviews.clone(),
+                repo: repo.clone(),
+                base_sha: pr.base_sha.clone(),
+                head_sha: pr.head_sha.clone(),
+                pr_title: pr.title.clone(),
+                diff: diff.clone(),
+                triage_section: triage_section.clone(),
+            };
+            let (findings, iters, calls) =
+                openai::review_hybrid_v20(&state, &pr.title, &diff, &triage_section, 7, &ctx).await;
+            (findings, Some(iters), Some(calls))
+        }
+    };
     let review_ms = review_start.elapsed().as_millis() as u64;
     info!("Review complete in {}ms: {} findings", review_ms, findings.len());
 
@@ -338,6 +541,8 @@ async fn run_review(state: Arc<AppState>, job_id: String) {
             triage_ms,
             review_ms,
             total_ms,
+            agent_iterations,
+            agent_tool_calls,
         },
     };
 

@@ -1,3 +1,4 @@
+use crate::openai::AgentContext;
 use inspect_core::types::EntityReview;
 use sem_core::model::change::ChangeType;
 
@@ -152,6 +153,30 @@ Return ONLY the issues that are verified real bugs with evidence in the diff.
 Respond with ONLY a JSON object:
 {{"issues": ["verified issue 1", "verified issue 2", ...]}}"#;
 
+pub const PROMPT_CHALLENGE: &str = r#"You are a devil's advocate reviewer. Your job is to DISPROVE each candidate bug. These candidates already passed one round of review, so they look plausible. Your job is to find reasons they are NOT real bugs.
+
+PR Title: {pr_title}
+
+PR Diff:
+{diff}
+
+Candidates that passed initial review:
+{candidates}
+
+For each candidate, actively try to disprove it:
+1. Read the FULL context in the diff. Does the surrounding code handle the case the finding describes?
+2. Is the finding about code that exists OUTSIDE the diff? If the finding claims something about code not shown, DROP it.
+3. Is the "bug" actually intentional behavior? Does the PR title or other changes suggest this is deliberate?
+4. Does the finding misread the code? Trace through the logic carefully.
+5. Is this about a test file? Test bugs rarely matter in production. DROP unless it causes silent test passes.
+
+ONLY keep findings where you cannot find any reason to doubt them. When in doubt, DROP.
+
+Respond with ONLY a JSON object:
+{{"issues": ["verified issue 1", "verified issue 2", ...]}}"#;
+
+pub const SYSTEM_CHALLENGE: &str = "You are a skeptical code reviewer. Your job is to find reasons candidates are NOT bugs. Only keep findings you cannot disprove. Always respond with valid JSON.";
+
 /// Smart diff truncation that deprioritizes tests, docs, configs.
 pub fn truncate_diff(diff: &str, max_chars: usize) -> String {
     if diff.len() <= max_chars {
@@ -295,12 +320,303 @@ pub fn format_validate_prompt(pr_title: &str, diff: &str, candidates: &str) -> S
         .replace("{candidates}", candidates)
 }
 
+pub fn format_challenge_prompt(pr_title: &str, diff: &str, candidates: &str) -> String {
+    PROMPT_CHALLENGE
+        .replace("{pr_title}", pr_title)
+        .replace("{diff}", diff)
+        .replace("{candidates}", candidates)
+}
+
 /// Format a lens prompt template with actual values.
 pub fn format_lens_prompt(template: &str, pr_title: &str, triage_section: &str, diff: &str) -> String {
     template
         .replace("{pr_title}", pr_title)
         .replace("{triage_section}", triage_section)
         .replace("{diff}", diff)
+}
+
+// --- Agentic review prompt ---
+
+pub const SYSTEM_AGENT_REVIEW: &str = r#"You are an expert code reviewer with tools to investigate a pull request. Your goal is to find real, confirmed bugs.
+
+You have access to:
+- `get_entity`: Get full before/after code and metadata for any changed entity from triage
+- `read_file`: Read any file in the repo at head or base commit
+- `search_code`: Search the repo for callers, implementations, usages
+- `get_dependents`: See what other code depends on a changed entity
+- `get_dependencies`: See what a changed entity depends on
+- `submit_findings`: Submit your final findings when done
+
+Strategy:
+1. Start with the highest-risk entities from triage
+2. For each suspicious change, investigate:
+   - Use get_entity to see the full before/after code
+   - Use get_dependents to understand blast radius
+   - Use read_file to check callers, interface definitions, type imports
+   - Use search_code to find all usages of a changed function/type
+3. Only report bugs you have confirmed with evidence
+4. Be efficient: max 15 tool calls total. Prioritize high-risk entities.
+
+What counts as a bug:
+- Logic errors, wrong conditions, off-by-one, broken control flow
+- Null/undefined safety: missing null checks, possible NPE
+- Concurrency bugs: race conditions, missing locks, unsafe shared state
+- API contract violations: wrong signatures, missing implementations, breaking changes
+- Data correctness: wrong constants, wrong mappings, copy-paste errors
+- Security: injection, auth bypass, SSRF, XSS
+- Runtime failures: TypeError, missing methods, wrong types
+
+What to skip:
+- Style, formatting, naming preferences
+- Missing tests or documentation
+- "Could be improved" suggestions
+- Issues in deleted/removed code
+- Theoretical issues without evidence
+
+When done investigating, call submit_findings with your confirmed bugs. If you find no bugs, submit an empty findings array."#;
+
+/// Build the initial prompt for agentic review.
+pub fn build_agent_initial_prompt(ctx: &AgentContext) -> String {
+    let truncated_diff = truncate_diff(&ctx.diff, 40_000);
+
+    format!(
+        r#"Review this pull request and investigate potential bugs using your tools.
+
+PR Title: {}
+
+{}
+
+PR Diff (truncated):
+{}
+
+Start by examining the highest-risk entities from triage using get_entity, then investigate cross-file impacts with get_dependents and read_file. Call submit_findings when done."#,
+        ctx.pr_title, ctx.triage_section, truncated_diff
+    )
+}
+
+// --- Agentic validation prompt ---
+
+pub const SYSTEM_AGENT_VALIDATE: &str = r#"You are a senior code reviewer doing final verification of candidate issues. You have tools to investigate each finding.
+
+Your job: go through the candidate findings and verify which ones are real bugs.
+
+For each candidate:
+1. If the issue is clearly visible in the diff and obviously correct, KEEP it.
+2. If the issue references cross-file behavior (callers, interfaces, types not in the diff), USE YOUR TOOLS to verify:
+   - read_file to check the referenced file at head or base commit
+   - search_code to find callers or implementations
+   - get_entity to see full before/after code and metadata
+   - get_dependents / get_dependencies for blast radius
+3. KEEP findings that are confirmed real bugs with evidence (from diff or tools).
+4. DROP: style/naming preferences, missing tests, theoretical/speculative issues, issues about deleted code, duplicate findings.
+
+Be thorough but efficient. Prioritize investigating findings that reference code outside the diff.
+
+When done, call submit_findings with only the verified bugs. For each, include the original issue description (you may rephrase for clarity) and the evidence you found."#;
+
+/// Build the initial prompt for agentic validation.
+pub fn build_agent_validate_prompt(ctx: &AgentContext, candidates: &[crate::openai::Finding]) -> String {
+    let truncated_diff = truncate_diff(&ctx.diff, 40_000);
+
+    let candidates_text: String = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let mut line = format!("{}. {}", i + 1, f.issue);
+            if let Some(ref ev) = f.evidence {
+                line.push_str(&format!("\n   Evidence: {ev}"));
+            }
+            if let Some(ref sev) = f.severity {
+                line.push_str(&format!(" [{}]", sev));
+            }
+            if let Some(ref file) = f.file {
+                line.push_str(&format!(" ({})", file));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"Verify these {count} candidate findings from an automated code review. Use your tools to check cross-file issues.
+
+PR Title: {title}
+
+{triage}
+
+Candidate Findings:
+{candidates}
+
+PR Diff (for reference):
+{diff}
+
+Go through each candidate. Use tools when a finding references behavior outside the diff. Call submit_findings when done with only the verified bugs."#,
+        count = candidates.len(),
+        title = ctx.pr_title,
+        triage = ctx.triage_section,
+        candidates = candidates_text,
+        diff = truncated_diff,
+    )
+}
+
+// --- Agent rescue prompt ---
+
+pub const SYSTEM_AGENT_RESCUE: &str = r#"You are a senior code reviewer doing a rescue pass. A previous automated reviewer rejected these findings because it could only see the diff and couldn't verify cross-file behavior.
+
+Your job: investigate each rejected finding using your tools. Some of these were REAL BUGS that got wrongly rejected because the evidence is in other files, not in the diff.
+
+For each rejected finding:
+1. Read the finding carefully. Does it claim something about cross-file behavior (callers, interfaces, types, state shared across files)?
+2. If YES: use your tools to verify. read_file to check the referenced code, search_code to find callers, get_dependents for blast radius.
+3. If you find CONCRETE EVIDENCE that the bug is real, RESCUE it.
+4. If you cannot find evidence, or the issue is speculative/style/theoretical, leave it rejected.
+
+Be selective. Only rescue findings where you found real code evidence with your tools. An empty rescue list is fine if nothing checks out.
+
+When done, call submit_findings with only the rescued bugs that you verified with tool evidence."#;
+
+/// Build the initial prompt for agent rescue pass.
+pub fn build_agent_rescue_prompt(ctx: &AgentContext, killed_findings: &[crate::openai::Finding]) -> String {
+    let killed_text: String = killed_findings
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let mut line = format!("{}. {}", i + 1, f.issue);
+            if let Some(ref ev) = f.evidence {
+                line.push_str(&format!("\n   Evidence: {ev}"));
+            }
+            if let Some(ref file) = f.file {
+                line.push_str(&format!(" ({})", file));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"These {count} findings were rejected by a reviewer who could only see the diff. Some may be real bugs that need cross-file evidence to verify.
+
+PR Title: {title}
+
+{triage}
+
+Rejected Findings:
+{killed}
+
+Investigate each one using your tools. Rescue the ones you can verify with real code evidence. Call submit_findings when done."#,
+        count = killed_findings.len(),
+        title = ctx.pr_title,
+        triage = ctx.triage_section,
+        killed = killed_text,
+    )
+}
+
+pub const SYSTEM_AGENT_CHALLENGE: &str = r#"You are a skeptical senior code reviewer. These findings already passed one round of review, so they look plausible. Your job is to try to DISPROVE each one using your tools.
+
+For each finding:
+1. Use read_file to read the FULL function/method mentioned. Don't trust the diff alone.
+2. Check if the surrounding code already handles the edge case the finding describes.
+3. Use search_code to check if there's error handling, validation, or fallback logic elsewhere.
+4. Use get_entity to see the full before/after code and trace the logic carefully.
+5. Check if the behavior described is actually intentional (read the PR title, check related code).
+
+ONLY keep findings where you CANNOT find any reason to doubt them after investigating.
+DROP a finding if:
+- The surrounding code (outside the diff) handles the case
+- The behavior is intentional based on other changes in the PR
+- The finding misreads the logic when you trace through the full function
+- The finding is about test code that doesn't affect production
+- You find evidence it's a false alarm
+
+When done, call submit_kept_indices with the NUMBERS of findings you want to keep. Do NOT rewrite or rephrase findings. Just return their indices."#;
+
+pub fn build_agent_challenge_prompt(ctx: &AgentContext, candidates: &[crate::openai::Finding]) -> String {
+    let candidates_text: String = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let mut line = format!("{}. {}", i + 1, f.issue);
+            if let Some(ref ev) = f.evidence {
+                line.push_str(&format!("\n   Evidence: {ev}"));
+            }
+            if let Some(ref file) = f.file {
+                line.push_str(&format!(" ({})", file));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"Try to disprove these {count} findings that passed initial review. Use your tools to investigate each one.
+
+PR Title: {title}
+
+{triage}
+
+Findings to challenge:
+{candidates}
+
+For each finding, use tools to check if the bug is real. Read full source files, check callers, verify the logic. Call submit_kept_indices with the NUMBERS of findings you could NOT disprove (e.g. [1, 3, 5])."#,
+        count = candidates.len(),
+        title = ctx.pr_title,
+        triage = ctx.triage_section,
+        candidates = candidates_text,
+    )
+}
+
+pub const SYSTEM_AGENT_EVIDENCE: &str = r#"You are a code investigation assistant. Your ONLY job is to gather evidence from the codebase. You do NOT decide if findings are bugs.
+
+A previous automated reviewer rejected some findings because it could only see the diff. Your job: investigate each rejected finding using your tools and report what you found. A separate reviewer will use your evidence to decide what to keep.
+
+For each rejected finding:
+1. Read the finding. Does it claim something about cross-file behavior (callers, interfaces, types, shared state)?
+2. If YES: use read_file and search_code to find the relevant code. Copy exact code snippets.
+3. Report your findings factually. Quote actual code. No opinions on whether it's a bug.
+4. Set verdict to "rescue" ONLY if you found concrete cross-file code that is directly relevant to the claimed issue. Set "reject" if you found nothing, or the claim is about code visible in the diff only.
+
+Rules:
+- Be FACTUAL. Quote code. No speculation.
+- If you can't find the file/function mentioned, verdict is "reject"
+- If the issue is about code that's only in the diff (no cross-file aspect), verdict is "reject"
+- An empty rescue list is totally fine
+
+When done investigating, call submit_evidence with your reports."#;
+
+/// Build the initial prompt for agent evidence gathering.
+pub fn build_agent_evidence_prompt(ctx: &AgentContext, killed_findings: &[crate::openai::Finding]) -> String {
+    let killed_text: String = killed_findings
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let mut line = format!("{}. {}", i, f.issue);
+            if let Some(ref ev) = f.evidence {
+                line.push_str(&format!("\n   Evidence: {ev}"));
+            }
+            if let Some(ref file) = f.file {
+                line.push_str(&format!(" ({})", file));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"These {count} findings were rejected by a reviewer who could only see the diff. Investigate each one using your tools and report what you find.
+
+PR Title: {title}
+
+{triage}
+
+Rejected Findings (0-indexed):
+{killed}
+
+For each finding, use your tools to look up the relevant cross-file code. Then call submit_evidence with your reports. Use the 0-based finding_index matching the numbers above."#,
+        count = killed_findings.len(),
+        title = ctx.pr_title,
+        triage = ctx.triage_section,
+        killed = killed_text,
+    )
 }
 
 /// Score an entity for triage ranking (matches Python entity_triage_score).

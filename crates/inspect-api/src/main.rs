@@ -32,6 +32,9 @@ async fn main() {
         .unwrap_or(3000);
     let openai_model =
         std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.2".to_string());
+    let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+    let anthropic_model =
+        std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string());
     let supabase_url = std::env::var("SUPABASE_URL").expect("SUPABASE_URL required");
     let supabase_key =
         std::env::var("SUPABASE_SERVICE_ROLE_KEY").expect("SUPABASE_SERVICE_ROLE_KEY required");
@@ -40,6 +43,8 @@ async fn main() {
         port,
         openai_api_key,
         openai_model: openai_model.clone(),
+        anthropic_api_key,
+        anthropic_model,
         github_token,
         http: reqwest::Client::new(),
         jobs: Arc::new(RwLock::new(HashMap::new())),
