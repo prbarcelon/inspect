@@ -57,9 +57,9 @@ entities (by risk):
 
 ## Two ways to use inspect
 
-**Local (free, open source):** CLI + MCP server. Entity triage, risk scoring, blast radius, commit untangling. No API key, no network calls. 5-67ms per commit. Works with any coding agent via MCP.
+**Local (free, open source):** CLI + MCP server. Entity triage, risk scoring, blast radius, commit untangling. `inspect review` sends the riskiest entities to any LLM you choose (Anthropic, OpenAI, Ollama, or any OpenAI-compatible server). No vendor lock-in.
 
-**Cloud API (optional):** Full LLM-powered review via `inspect.ataraxy-labs.com`. Combines entity triage with 9 specialized review lenses. Or self-host the API with your own OpenAI key.
+**Hosted API (optional):** Full review via `inspect.ataraxy-labs.com`. Goes further than local review with 9 specialized lenses, cross-model ensemble, and validation passes. Submit a PR, get back findings.
 
 ## Install
 
@@ -214,33 +214,33 @@ The approach: entity-level triage cuts 100+ changed entities to the 60 riskiest,
 
 Dataset: [HuggingFace](https://huggingface.co/datasets/rs545837/inspect-greptile-bench). Judge: heuristic keyword matching applied identically to all tools.
 
-## Martian Benchmark (#1 on leaderboard)
+## Hosted API
 
-137 golden bugs, 50 PRs, GPT-5.2 judge. The standard benchmark for comparing code review tools.
+For teams that don't want to manage LLM infrastructure, we run a hosted review service at `inspect.ataraxy-labs.com`. It goes beyond what `inspect review` does locally.
 
-| Rank | Tool | F1 | Precision | Recall |
-|------|------|----|-----------|--------|
-| #1 | **inspect + GPT-5.2** | **46.1%** | **44.8%** | **47.4%** |
-| #2 | Augment | 45.8% | 37.3% | 59.1% |
-| #3 | Cursor Bugbot | 40.5% | 38.3% | 43.1% |
-| #4 | Propel | 38.1% | 38.9% | 37.2% |
-| #5 | Greptile | 35.1% | 33.8% | 36.5% |
-| #6 | Claude Code | 33.6% | 30.5% | 37.2% |
-| #7 | GitHub Copilot | 32.6% | 23.5% | 53.3% |
-| #8 | Baz | 30.3% | 34.6% | 27.0% |
-| #9 | Qodo | 30.1% | 23.4% | 42.3% |
-| #10 | CodeRabbit | 28.1% | 21.2% | 41.6% |
-| #11 | Gemini | 28.1% | 24.6% | 32.8% |
-| #12 | Kilo+Grok | 25.0% | 48.9% | 16.8% |
+**What the hosted API does differently:**
 
-## How the Review Works
-
-1. **Entity triage** ranks changes by graph signals: blast radius, dependents, public API, entity type
-2. Top 10 entities get BEFORE/AFTER source code sent alongside the diff
-3. **9 parallel review lenses**: 6 specialized (data correctness, concurrency, contracts, security, typos, runtime) + 3 general
+1. Entity triage ranks changes by graph signals (same as local)
+2. 9 parallel review lenses: 6 specialized (data correctness, concurrency, contracts, security, typos, runtime) + 3 general
+3. Cross-model ensemble for higher recall
 4. Structural filter drops findings that reference files not in the diff
 5. Validation pass confirms each finding against the actual code
-6. Top 7 findings returned
+
+```bash
+# Submit a PR for review
+curl -X POST https://inspect.ataraxy-labs.com/api/review \
+  -H "Authorization: Bearer insp_..." \
+  -H "Content-Type: application/json" \
+  -d '{"repo":"owner/repo","pr_number":123}'
+
+# Entity triage only (no LLM, returns in 1-3s)
+curl -X POST https://inspect.ataraxy-labs.com/api/triage \
+  -H "Authorization: Bearer insp_..." \
+  -H "Content-Type: application/json" \
+  -d '{"repo":"owner/repo","pr_number":123}'
+```
+
+Get an API key at [inspect.ataraxy-labs.com/dashboard/keys](https://inspect.ataraxy-labs.com/dashboard/keys).
 
 ## Triage Benchmark
 
