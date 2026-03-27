@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Living Codebase</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#050508;color:#e0e0e0;overflow:hidden;font-family:'Inter',sans-serif;cursor:pointer}
+  canvas{position:fixed;top:0;left:0}
+
+  #hero{
+    position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+    text-align:center;z-index:10;pointer-events:none;
+    opacity:1;transition:opacity 2s ease;
+  }
+  #hero.fade{opacity:0}
+  #hero h1{
+    font-size:58px;font-weight:800;letter-spacing:-3px;line-height:1.1;
+    background:linear-gradient(135deg,#4ade80,#22d3ee,#a78bfa);
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+    background-size:200% 200%;animation:g 8s ease infinite;margin-bottom:12px;
+  }
+  @keyframes g{0%,100%{background-position:0% 50%}50%{background-position:100% 50%}}
+  #hero .sub{font-size:15px;color:#444;line-height:1.8;max-width:420px;margin:0 auto 20px}
+  #hero .hint{font-size:12px;color:#555;animation:p 2s ease infinite}
+  #hero .hint em{color:#4ade80;font-style:normal}
+  @keyframes p{0%,100%{opacity:.3}50%{opacity:1}}
+
+  /* Tool watermark */
+  #wm{
+    position:fixed;top:50%;left:50%;z-index:5;
+    transform:translate(-50%,-50%);
+    font-size:140px;font-weight:800;letter-spacing:-7px;
+    pointer-events:none;opacity:0;
+    transition:opacity 1.2s ease,color 1s ease;
+    -webkit-text-fill-color:transparent;
+  }
+  #wm.sem{opacity:1;-webkit-text-stroke:1.5px rgba(74,222,128,0.07)}
+  #wm.inspect{opacity:1;-webkit-text-stroke:1.5px rgba(248,113,113,0.09)}
+  #wm.agent{opacity:1;-webkit-text-stroke:1.5px rgba(250,204,21,0.08)}
+  #wm.weave{opacity:1;-webkit-text-stroke:1.5px rgba(34,211,238,0.07)}
+
+  /* HUD */
+  #hud{
+    position:fixed;top:16px;right:20px;z-index:10;
+    font:10px 'SF Mono',monospace;color:#333;text-align:right;line-height:2.2;
+    opacity:0;transition:opacity 1s ease;pointer-events:none;
+  }
+  #hud.vis{opacity:1}
+  .hv{font-weight:600}
+  .hg{color:#4ade80}.hr{color:#f87171}.ho{color:#fb923c}.hc{color:#22d3ee}.hy{color:#facc15}
+
+  /* Info panel (shows on click) */
+  #info{
+    position:fixed;bottom:16px;left:16px;z-index:10;
+    background:rgba(8,8,14,0.92);border:1px solid #1a1a24;
+    border-radius:10px;padding:14px 18px;max-width:400px;min-width:300px;
+    font:11px 'SF Mono',monospace;line-height:1.9;
+    backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+    opacity:0;transform:translateY(10px);pointer-events:none;
+    transition:opacity 0.4s ease,transform 0.4s ease;
+  }
+  #info.vis{opacity:1;transform:translateY(0)}
+  #info .ig{color:#4ade80}#info .ir{color:#f87171}
+  #info .io{color:#fb923c}#info .ic{color:#22d3ee}
+  #info .id{color:#333}#info .iw{color:#e0e0e0;font-weight:600}
+  .il{opacity:0;transform:translateX(-5px);transition:all .2s ease;white-space:pre}
+  .il.v{opacity:1;transform:translateX(0)}
+
+  /* EKG */
+  #ekg{
+    position:fixed;bottom:40px;left:0;width:100%;height:120px;z-index:9;
+    pointer-events:none;opacity:0;transition:opacity 1s ease;
+  }
+  #ekg.vis{opacity:1}
+</style>
+</head>
+<body>
+
+<canvas id="cv"></canvas>
+<canvas id="ekg"></canvas>
+
+<div id="hero">
+  <h1>Your code<br>is alive.</h1>
+  <div class="sub">Four systems keep it healthy.<br>A nervous system. Pain receptors. A surgeon. An immune system.</div>
+  <div class="hint"><em>Click any node</em> to feel the impact.</div>
+</div>
+
+<div id="wm">sem</div>
+
+<div id="hud">
+  <div>heartbeat <span class="hv hg" id="hb">60</span></div>
+  <div>entities <span class="hv hc">16</span></div>
+  <div>edges <span class="hv hc">19</span></div>
+  <div>system <span class="hv hg" id="hs">sem</span></div>
+  <div>status <span class="hv hg" id="hst">resting</span></div>
+</div>
+
+<div id="info"></div>
+
+<script>
+const cv=document.getElementById('cv'),X=cv.getContext('2d');
+const ekgCv=document.getElementById('ekg'),ekgX=ekgCv.getContext('2d');
+let W,H,dpr;
+
+function resize(){
+  dpr=devicePixelRatio||1;W=innerWidth;H=innerHeight;
+  cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+'px';cv.style.height=H+'px';
+  X.setTransform(dpr,0,0,dpr,0,0);
+  ekgCv.width=W*dpr;ekgCv.height=120*dpr;ekgCv.style.width=W+'px';ekgCv.style.height='120px';
+  ekgX.setTransform(dpr,0,0,dpr,0,0);
+  doLayout();
+}
+
+// ---- GRAPH ----
+const ND=[
+  {id:'process_payment',lbl:'process_payment()',w:9},
+  {id:'validate_card',lbl:'validate_card()',w:5},
+  {id:'send_receipt',lbl:'send_receipt()',w:5},
+  {id:'check_fraud',lbl:'check_fraud()',w:4},
+  {id:'Transaction',lbl:'Transaction',w:6},
+  {id:'notify_user',lbl:'notify_user()',w:3},
+  {id:'log_event',lbl:'log_event()',w:2},
+  {id:'update_balance',lbl:'update_balance()',w:5},
+  {id:'email_tpl',lbl:'email_template()',w:1},
+  {id:'parse_config',lbl:'parse_config()',w:2},
+  {id:'db_connect',lbl:'db_connect()',w:7},
+  {id:'AuthMiddleware',lbl:'AuthMiddleware',w:6},
+  {id:'rate_limit',lbl:'rate_limit()',w:4},
+  {id:'hash_password',lbl:'hash_password()',w:3},
+  {id:'SessionStore',lbl:'SessionStore',w:4},
+  {id:'refresh_token',lbl:'refresh_token()',w:3},
+];
+const ED=[[0,1],[0,2],[0,4],[1,3],[1,6],[2,5],[2,8],[4,7],[5,7],[3,6],
+  [11,12],[11,13],[11,14],[14,15],[15,10],[12,6],[13,10],[9,10],[7,10]];
+const POS=[
+  [0,-0.55],[-0.33,-0.17],[0.33,-0.17],[-0.53,0.13],[0,-0.03],
+  [0.53,0.13],[-0.43,0.43],[0.18,0.38],[0.6,0.44],[-0.72,-0.48],
+  [0,0.7],[0.72,-0.48],[0.84,-0.17],[0.63,0.01],[0.84,0.16],[0.73,0.43],
+];
+
+const nodes=ND.map((d,i)=>({
+  ...d,i,x:0,y:0,bx:0,by:0,dx:0,dy:0,
+  ph:Math.random()*Math.PI*2,r:4+d.w*0.65,
+  alpha:0,state:'idle',st:0,temp:0.5,
+}));
+const edges=ED.map(([a,b])=>({
+  a,b,alpha:0,hot:false,heal:false,
+  particles:[],
+  cv:0.07+Math.random()*0.11,cd:Math.random()>0.5?1:-1,
+}));
+
+const amb=[];
+for(let i=0;i<60;i++) amb.push({
+  x:Math.random()*3000,y:Math.random()*2000,
+  vx:(Math.random()-0.5)*0.1,vy:(Math.random()-0.5)*0.1,
+  r:Math.random()*1+0.3,a:Math.random()*0.1+0.02,
+});
+
+function doLayout(){
+  const cx=W/2,cy=H/2,s=Math.min(W,H)*0.37;
+  nodes.forEach((n,i)=>{
+    n.bx=cx+POS[i][0]*s;n.by=cy+POS[i][1]*s;
+    n.x=n.bx;n.y=n.by;
+    n.dx=(Math.random()-0.5)*0.05;n.dy=(Math.random()-0.5)*0.05;
+  });
+}
+
+function eMid(e){
+  const a=nodes[e.a],b=nodes[e.b];
+  const mx=(a.x+b.x)/2,my=(a.y+b.y)/2;
+  const dx=b.x-a.x,dy=b.y-a.y,l=Math.sqrt(dx*dx+dy*dy)||1;
+  return{x:mx+(-dy/l)*l*e.cv*e.cd,y:my+(dx/l)*l*e.cv*e.cd};
+}
+function ePt(e,t){
+  const a=nodes[e.a],b=nodes[e.b],m=eMid(e);const u=1-t;
+  return{x:u*u*a.x+2*u*t*m.x+t*t*b.x,y:u*u*a.y+2*u*t*m.y+t*t*b.y};
+}
+function spawnP(e){e.particles.push({t:0,speed:0.002+Math.random()*0.003,a:0.2+Math.random()*0.35,r:1+Math.random()*1});}
+
+// ---- STATE ----
+let gt=0,heartRate=60,heartPh=0,ekgHistory=[];
+let mode='rest'; // rest | sem | inspect | agent | weave
+let clickedNode=-1;
+let heroVisible=true;
+let animQueue=[];
+
+// Agent state
+let agent={
+  active:false,
+  x:0,y:0, // current position
+  tx:0,ty:0, // target position
+  trail:[], // trailing positions for comet tail
+  fixing:-1, // index of node currently being fixed
+  progress:0, // 0-1 travel progress
+  speed:2.5,
+};
+
+// Fade hero after 4s
+setTimeout(()=>{
+  document.getElementById('hero').classList.add('fade');
+  document.getElementById('hud').classList.add('vis');
+  document.getElementById('ekg').classList.add('vis');
+  setTimeout(()=>{heroVisible=false},2000);
+},4000);
+
+function resetAll(){
+  nodes.forEach(n=>{n.state='idle';n.st=0;n.temp=0.5});
+  edges.forEach(e=>{e.hot=false;e.heal=false});
+  agent.active=false;agent.trail=[];agent.fixing=-1;
+  heartRate=60;mode='rest';
+  setWm('');
+  setHud('resting','g','sem','g',60,'g');
+}
+
+function setWm(t){
+  const el=document.getElementById('wm');
+  el.textContent=t;el.className=t;
+}
+function setHud(stat,sc,sys,syc,bpm,bc){
+  document.getElementById('hst').textContent=stat;document.getElementById('hst').className='hv h'+sc;
+  document.getElementById('hs').textContent=sys;document.getElementById('hs').className='hv h'+syc;
+  document.getElementById('hb').textContent=bpm;document.getElementById('hb').className='hv h'+bc;
+}
+
+function showInfo(html){
+  const el=document.getElementById('info');
+  el.innerHTML=html;el.classList.add('vis');
+  // Animate lines
+  setTimeout(()=>{el.querySelectorAll('.il').forEach((l,i)=>{setTimeout(()=>l.classList.add('v'),i*120)})},50);
+}
+function hideInfo(){document.getElementById('info').classList.remove('vis');}
+
+// ---- CLICK ----
+cv.addEventListener('click',e=>{
+  // Fade hero immediately on first click
+  if(heroVisible){
+    document.getElementById('hero').classList.add('fade');
+    document.getElementById('hud').classList.add('vis');
+    document.getElementById('ekg').classList.add('vis');
+    heroVisible=false;
+  }
+
+  const mx=e.clientX,my=e.clientY;
+  let ci=-1,cd=55;
+  nodes.forEach((n,i)=>{const d=Math.hypot(n.x-mx,n.y-my);if(d<cd){ci=i;cd=d;}});
+  if(ci<0){resetAll();hideInfo();return;}
+
+  // Reset previous
+  resetAll();
+  clickedNode=ci;
+
+  // ---- PHASE 1: sem (nervous system detects) ----
+  mode='sem';
+  setWm('sem');
+  nodes[ci].state='changed';nodes[ci].st=0;nodes[ci].temp=1;
+  heartRate=100;
+  setHud('detecting','o','sem','g',100,'o');
+
+  // BFS to find dependents
+  const aff=new Set();const q=[ci];
+  while(q.length){const c=q.shift();edges.forEach(e=>{if(e.a===c&&!aff.has(e.b)){aff.add(e.b);q.push(e.b);}});}
+  const affArr=[...aff];
+  const safeArr=[];
+  nodes.forEach((n,i)=>{if(i!==ci&&!aff.has(i))safeArr.push(i)});
+
+  // Propagate with delay (sem mapping the impact)
+  let d=0;
+  affArr.forEach(idx=>{
+    d+=220;
+    setTimeout(()=>{
+      nodes[idx].state='affected';nodes[idx].st=0;nodes[idx].temp=0.85;
+      edges.forEach(e=>{
+        if(e.b===idx&&(nodes[e.a].state==='changed'||nodes[e.a].state==='affected'))e.hot=true;
+      });
+    },d);
+  });
+
+  // ---- PHASE 2: inspect (pain scoring) ----
+  const inspectDelay=d+500;
+  setTimeout(()=>{
+    mode='inspect';
+    setWm('inspect');
+    heartRate=60+affArr.length*22;
+    const sev=affArr.length>3?'r':'o';
+    setHud(affArr.length+' affected',sev,'inspect','r',heartRate,sev);
+
+    safeArr.forEach((idx,i)=>{
+      setTimeout(()=>{nodes[idx].state='safe';nodes[idx].st=0;},i*60);
+    });
+
+    // Show info panel
+    const name=nodes[ci].lbl;
+    const blast=Math.round(nodes[ci].w*19);
+    let lines=`<div class="il"><span class="ic">sem</span> <span class="id">extracted ${nodes.length} entities, ${edges.length} edges</span></div>`;
+    lines+=`<div class="il"></div>`;
+    lines+=`<div class="il"><span class="io">CHANGED</span> <span class="iw">${name}</span></div>`;
+    lines+=`<div class="il">  <span class="id">blast radius:</span> <span class="ir">${blast}</span></div>`;
+    lines+=`<div class="il"></div>`;
+    lines+=`<div class="il"><span class="ir">inspect</span> <span class="id">${affArr.length} transitive dependents:</span></div>`;
+    affArr.forEach((idx,i)=>{
+      lines+=`<div class="il">  <span class="ir">${i+1}.</span> ${nodes[idx].lbl}</div>`;
+    });
+    if(safeArr.length>0){
+      lines+=`<div class="il"></div>`;
+      lines+=`<div class="il"><span class="ig">SAFE</span> <span class="id">${safeArr.length} entities (no dependency path)</span></div>`;
+    }
+    showInfo(lines);
+
+  },inspectDelay);
+
+  // ---- PHASE 3: agent (arrives to fix) ----
+  const agentDelay=inspectDelay+3500;
+  const targets=[ci,...affArr]; // visit changed node first, then each affected
+  setTimeout(()=>{
+    mode='agent';
+    setWm('agent');
+    heartRate=90;
+    setHud('agent fixing','y','agent','y',90,'y');
+
+    // Start agent at the changed node
+    agent.active=true;
+    agent.x=nodes[ci].x;agent.y=nodes[ci].y;
+    agent.trail=[];agent.fixing=-1;agent.progress=1;
+    agent.queue=[...targets]; // nodes to visit
+    agent.current=0; // index into queue
+
+    // Start fixing the first node immediately
+    nodes[ci].state='fixing';nodes[ci].st=0;
+    agent.fixing=ci;
+
+    // Update info
+    const el=document.getElementById('info');
+    const extra=document.createElement('div');
+    extra.innerHTML=`<div class="il" style="margin-top:6px"><span class="iy" style="color:#facc15">agent</span> <span class="id">dispatched with sem + inspect + weave</span></div><div class="il">  <span class="id">fixing ${targets.length} entities...</span></div>`;
+    el.appendChild(extra);
+    setTimeout(()=>extra.querySelectorAll('.il').forEach((l,i)=>setTimeout(()=>l.classList.add('v'),i*120)),50);
+
+    // Sequence: fix each node with a delay
+    let fd=600;
+    targets.forEach((idx,ti)=>{
+      // Mark as fixed after delay
+      setTimeout(()=>{
+        nodes[idx].state='fixed';nodes[idx].st=0;nodes[idx].temp=0.6;
+        // Move agent to next target
+        if(ti+1<targets.length){
+          const next=targets[ti+1];
+          agent.fixing=next;
+          agent.tx=nodes[next].x;agent.ty=nodes[next].y;
+          agent.progress=0;
+          nodes[next].state='fixing';nodes[next].st=0;
+        }
+      },fd);
+      fd+=700; // 700ms per node fix
+    });
+
+    // After all fixed, transition to weave
+    const totalAgentTime=600+targets.length*700+300;
+    setTimeout(()=>{
+      agent.active=false;agent.trail=[];
+
+      // ---- PHASE 4: weave (merge clean) ----
+      mode='weave';
+      setWm('weave');
+      heartRate=80;
+      setHud('merging','c','weave','c',80,'c');
+
+      // Cyan sweep
+      edges.forEach((e,i)=>{setTimeout(()=>{e.hot=false;e.heal=true},i*70)});
+      nodes.forEach((n,i)=>{
+        if(n.state==='fixed'||n.state==='fixing'){
+          setTimeout(()=>{n.state='healing';n.st=0},i*90);
+          setTimeout(()=>{n.state='safe';n.st=0;n.temp=0.5},i*90+800);
+        }
+      });
+
+      // Update info
+      setTimeout(()=>{
+        const el2=document.getElementById('info');
+        const extra2=document.createElement('div');
+        extra2.innerHTML=`<div class="il" style="margin-top:6px"><span class="ic">weave</span> <span class="id">entity-level merge</span></div><div class="il">  <span class="ig">all clean</span> <span class="id">in 4ms</span></div>`;
+        el2.appendChild(extra2);
+        setTimeout(()=>extra2.querySelectorAll('.il').forEach((l,i)=>setTimeout(()=>l.classList.add('v'),i*120)),50);
+      },500);
+
+      setTimeout(()=>{
+        heartRate=60;mode='rest';setWm('');
+        edges.forEach(e=>e.heal=false);
+        setHud('healed','g','all','g',60,'g');
+      },3500);
+
+    },totalAgentTime);
+
+  },agentDelay);
+});
+
+// ---- RENDER ----
+let last=performance.now();
+
+function draw(now){
+  const dt=Math.min((now-last)/1000,0.05);
+  last=now;gt+=dt;
+
+  heartPh+=dt*(heartRate/60);
+  heartPh%=1; // 0-1 per beat
+
+  // PQRST waveform generator (realistic ECG shape)
+  function ecgWave(t){
+    // t is 0-1 within one heartbeat cycle
+    // P wave: small bump at ~0.1
+    const pWave=0.12*Math.exp(-Math.pow((t-0.1)/0.03,2));
+    // Q dip: small negative at ~0.18
+    const qWave=-0.08*Math.exp(-Math.pow((t-0.18)/0.012,2));
+    // R spike: tall sharp peak at ~0.2
+    const rWave=1.0*Math.exp(-Math.pow((t-0.2)/0.014,2));
+    // S dip: negative after R at ~0.22
+    const sWave=-0.2*Math.exp(-Math.pow((t-0.23)/0.013,2));
+    // T wave: broad bump at ~0.35
+    const tWave=0.25*Math.exp(-Math.pow((t-0.35)/0.045,2));
+    return pWave+qWave+rWave+sWave+tWave;
+  }
+
+  const ekgVal=ecgWave(heartPh);
+  const hb=Math.max(0,ekgVal); // use for visual effects (glow, contraction)
+  const contract=1-hb*0.012;
+
+  X.clearRect(0,0,W,H);
+
+  // Background color based on mode
+  let bgCol=mode==='inspect'?'248,113,113':mode==='agent'?'250,204,21':mode==='weave'?'34,211,238':'74,222,128';
+  const bgInt=0.02+hb*0.018;
+  const bgR=Math.min(W,H)*0.65;
+  const bg=X.createRadialGradient(W/2,H/2,0,W/2,H/2,bgR);
+  bg.addColorStop(0,`rgba(${bgCol},${bgInt})`);
+  bg.addColorStop(0.5,`rgba(${bgCol},${bgInt*0.3})`);
+  bg.addColorStop(1,'transparent');
+  X.fillStyle=bg;X.fillRect(0,0,W,H);
+
+  // Ambient
+  const ac=bgCol;
+  amb.forEach(p=>{
+    p.x+=p.vx;p.y+=p.vy;
+    if(p.x<0||p.x>W)p.vx*=-1;if(p.y<0||p.y>H)p.vy*=-1;
+    X.beginPath();X.arc(p.x,p.y,p.r,0,Math.PI*2);
+    X.fillStyle=`rgba(${ac},${p.a*(0.4+hb*0.5)})`;X.fill();
+  });
+
+  // Nodes update
+  const cx=W/2,cy=H/2;
+  nodes.forEach(n=>{
+    n.ph+=0.004+n.temp*0.003;n.st+=dt;
+    n.dx+=(Math.random()-0.5)*0.007;n.dy+=(Math.random()-0.5)*0.007;
+    n.dx*=0.987;n.dy*=0.987;n.bx+=n.dx;n.by+=n.dy;
+    const s=Math.min(W,H)*0.37;
+    n.bx+=(cx+POS[n.i][0]*s-n.bx)*0.006;
+    n.by+=(cy+POS[n.i][1]*s-n.by)*0.006;
+    n.x=cx+(n.bx-cx)*contract;n.y=cy+(n.by-cy)*contract;
+    n.x+=Math.sin(n.ph)*1.2;n.y+=Math.cos(n.ph*0.7)*0.7;
+    if(n.alpha<0.8)n.alpha=Math.min(n.alpha+dt*0.5,0.8);
+    n.temp+=(0.5-n.temp)*dt*0.3;
+  });
+
+  // Spawn particles
+  edges.forEach(e=>{
+    if(e.alpha<0.3)e.alpha=Math.min(e.alpha+dt*0.15,0.3);
+    const rate=e.hot?0.2:e.heal?0.15:0.025+hb*0.045;
+    if(Math.random()<rate)spawnP(e);
+  });
+
+  // Draw edges
+  edges.forEach(e=>{
+    const a=nodes[e.a],b=nodes[e.b],m=eMid(e);
+    let ec,ew;
+    if(e.hot){ec=`rgba(248,113,113,${0.28+Math.sin(gt*5)*0.1})`;ew=1.5+hb;}
+    else if(e.heal){ec=`rgba(34,211,238,${0.3+hb*0.12})`;ew=1.3+hb*0.4;}
+    else{ec=`rgba(74,222,128,${e.alpha*(0.35+hb*0.3)})`;ew=0.5+hb*0.25;}
+    X.beginPath();X.moveTo(a.x,a.y);X.quadraticCurveTo(m.x,m.y,b.x,b.y);
+    X.strokeStyle=ec;X.lineWidth=ew;X.stroke();
+
+    e.particles.forEach(p=>{
+      p.t+=p.speed*(e.hot?2.8:e.heal?2.2:1);
+      if(p.t>1){p.t=-1;return}if(p.t<0)return;
+      const pt=ePt(e,p.t);const fade=1-Math.abs(p.t-0.5)*2;
+      const pa=p.a*fade;
+      X.beginPath();X.arc(pt.x,pt.y,p.r*(e.hot?1.3:1),0,Math.PI*2);
+      if(e.hot){X.fillStyle=`rgba(248,113,113,${pa*1.3})`;X.shadowColor='#f87171';X.shadowBlur=10;}
+      else if(e.heal){X.fillStyle=`rgba(34,211,238,${pa*1.2})`;X.shadowColor='#22d3ee';X.shadowBlur=8;}
+      else{X.fillStyle=`rgba(74,222,128,${pa*0.7})`;X.shadowColor='#4ade80';X.shadowBlur=5;}
+      X.fill();X.shadowBlur=0;
+    });
+    e.particles=e.particles.filter(p=>p.t>=0);
+  });
+
+  // Draw nodes
+  nodes.forEach(n=>{
+    const breath=Math.sin(n.ph)*0.1+1;
+    const r=n.r*breath*(1+hb*0.06);
+    let fill,glow,gs;
+
+    if(n.state==='changed'){
+      const p=Math.sin(n.st*5)*0.2+0.8;
+      fill=`rgba(251,146,60,${p})`;glow='#fb923c';gs=22+hb*12;
+      for(let k=0;k<3;k++){
+        const age=n.st-k*0.25;
+        if(age>0&&age<2){
+          X.beginPath();X.arc(n.x,n.y,age*60,0,Math.PI*2);
+          X.strokeStyle=`rgba(251,146,60,${Math.max(0,1-age/2)*0.2})`;X.lineWidth=1.2;X.stroke();
+        }
+      }
+    }else if(n.state==='affected'){
+      const fi=Math.min(n.st/0.3,1);
+      fill=`rgba(248,113,113,${(Math.sin(n.st*4)*0.2+0.7)*fi})`;glow='#f87171';gs=16*fi+hb*8;
+      if(n.st<0.8){
+        X.beginPath();X.arc(n.x,n.y,n.st*45,0,Math.PI*2);
+        X.strokeStyle=`rgba(248,113,113,${Math.max(0,1-n.st/0.8)*0.2})`;X.lineWidth=1;X.stroke();
+      }
+    }else if(n.state==='fixing'){
+      // Gold pulse while agent works on it
+      const fp=Math.sin(n.st*8)*0.25+0.75;
+      fill=`rgba(250,204,21,${fp})`;glow='#facc15';gs=22+hb*10;
+      // Spinning ring
+      X.beginPath();
+      const ra=n.st*4;
+      X.arc(n.x,n.y,r+6+Math.sin(n.st*6)*2,ra,ra+Math.PI*1.2);
+      X.strokeStyle=`rgba(250,204,21,${0.5+Math.sin(n.st*5)*0.2})`;X.lineWidth=1.5;X.stroke();
+      // Sparks
+      for(let s=0;s<2;s++){
+        const sa=ra+s*Math.PI;
+        const sx=n.x+Math.cos(sa)*(r+8);
+        const sy=n.y+Math.sin(sa)*(r+8);
+        X.beginPath();X.arc(sx,sy,1.2,0,Math.PI*2);
+        X.fillStyle=`rgba(250,204,21,${0.6+Math.sin(n.st*10+s)*0.3})`;X.fill();
+      }
+    }else if(n.state==='fixed'){
+      // Briefly bright green, fading to calm
+      const ff=Math.max(0,1-n.st/1.5);
+      fill=`rgba(74,222,128,${0.5+ff*0.4})`;glow='#4ade80';gs=10+ff*14+hb*4;
+      if(n.st<0.4){
+        X.beginPath();X.arc(n.x,n.y,n.st*40,0,Math.PI*2);
+        X.strokeStyle=`rgba(74,222,128,${Math.max(0,1-n.st/0.4)*0.3})`;X.lineWidth=1;X.stroke();
+      }
+    }else if(n.state==='healing'){
+      fill=`rgba(34,211,238,${0.5+Math.sin(n.st*7)*0.3})`;glow='#22d3ee';gs=16+hb*6;
+      if(n.st<0.5){
+        X.beginPath();X.arc(n.x,n.y,n.st*35,0,Math.PI*2);
+        X.strokeStyle=`rgba(34,211,238,${Math.max(0,1-n.st/0.5)*0.25})`;X.lineWidth=1;X.stroke();
+      }
+    }else if(n.state==='safe'){
+      fill=`rgba(74,222,128,${0.45+hb*0.18})`;glow='#4ade80';gs=8+hb*4;
+    }else{
+      fill=`rgba(74,222,128,${0.28+n.temp*0.2+hb*0.14})`;glow='#4ade80';gs=5+hb*5;
+    }
+
+    // Aura
+    X.shadowColor=glow;X.shadowBlur=gs;
+    X.beginPath();X.arc(n.x,n.y,r+2,0,Math.PI*2);
+    X.fillStyle=glow;X.globalAlpha=0.03+hb*0.02;X.fill();
+    X.globalAlpha=1;X.shadowBlur=0;
+
+    // Core
+    X.shadowColor=glow;X.shadowBlur=gs*0.5;
+    X.beginPath();X.arc(n.x,n.y,r,0,Math.PI*2);
+    X.fillStyle=fill;X.globalAlpha=n.alpha;X.fill();
+    X.globalAlpha=1;X.shadowBlur=0;
+
+    // Label
+    X.font='9.5px "SF Mono","Fira Code",monospace';X.textAlign='center';
+    const lc=n.state==='changed'?'#fb923c':n.state==='affected'?'#f87171':n.state==='fixing'?'#facc15':n.state==='fixed'?'#4ade80':n.state==='healing'?'#22d3ee':n.state==='safe'?'#4ade80':'#2a2a2a';
+    X.fillStyle=lc;X.globalAlpha=n.state==='idle'?0.28+hb*0.07:0.75;
+    X.fillText(n.lbl,n.x,n.y+r+14);X.globalAlpha=1;
+
+    // State tag
+    if(n.state!=='idle'&&n.state!=='safe'){
+      X.font='bold 7px Inter,sans-serif';X.fillStyle=lc;
+      X.globalAlpha=Math.min(n.st/0.3,1)*0.8;
+      X.fillText(n.state==='healing'?'MERGING':n.state==='fixing'?'FIXING':n.state==='fixed'?'FIXED':n.state.toUpperCase(),n.x,n.y-r-7);
+      X.globalAlpha=1;
+    }
+
+    // Hover highlight: brighten node near mouse
+    // (handled via cursor already)
+  });
+
+  // ---- AGENT ORB ----
+  if(agent.active){
+    // Smooth travel toward target
+    if(agent.progress<1){
+      agent.progress=Math.min(agent.progress+dt*agent.speed,1);
+      const ease=agent.progress<0.5?2*agent.progress*agent.progress:1-Math.pow(-2*agent.progress+2,2)/2;
+      const sn=nodes[agent.fixing];
+      if(sn){
+        agent.tx=sn.x;agent.ty=sn.y;
+      }
+      agent.x+=(agent.tx-agent.x)*ease*0.15;
+      agent.y+=(agent.ty-agent.y)*ease*0.15;
+    }else if(agent.fixing>=0){
+      // Orbit around the node being fixed
+      const fn=nodes[agent.fixing];
+      if(fn){
+        const or=fn.r+14+Math.sin(gt*3)*3;
+        agent.x=fn.x+Math.cos(gt*4)*or;
+        agent.y=fn.y+Math.sin(gt*4)*or;
+      }
+    }
+
+    // Trail
+    agent.trail.push({x:agent.x,y:agent.y,t:gt});
+    if(agent.trail.length>40)agent.trail.shift();
+
+    // Draw trail (comet tail)
+    for(let i=0;i<agent.trail.length-1;i++){
+      const p=agent.trail[i];
+      const a=(i/agent.trail.length);
+      X.beginPath();X.arc(p.x,p.y,1+a*2.5,0,Math.PI*2);
+      X.fillStyle=`rgba(250,204,21,${a*0.25})`;X.fill();
+    }
+
+    // Main orb (glowing gold)
+    X.shadowColor='#facc15';X.shadowBlur=30+Math.sin(gt*5)*8;
+    X.beginPath();X.arc(agent.x,agent.y,5+Math.sin(gt*6)*1,0,Math.PI*2);
+    X.fillStyle='rgba(250,204,21,0.9)';X.fill();
+
+    // Inner bright core
+    X.beginPath();X.arc(agent.x,agent.y,2.5,0,Math.PI*2);
+    X.fillStyle='rgba(255,255,255,0.8)';X.fill();
+    X.shadowBlur=0;
+
+    // Outer pulse ring
+    const pr=(gt*2)%1;
+    X.beginPath();X.arc(agent.x,agent.y,5+pr*18,0,Math.PI*2);
+    X.strokeStyle=`rgba(250,204,21,${(1-pr)*0.25})`;X.lineWidth=1;X.stroke();
+  }
+
+  // ---- EKG ----
+  const ekgW=W,ekgH=120;
+  ekgX.clearRect(0,0,ekgW,ekgH);
+
+  // Push the actual PQRST value (includes negative Q and S dips)
+  ekgHistory.push(ekgVal);
+  if(ekgHistory.length>ekgW/2)ekgHistory.shift();
+
+  const ec=mode==='inspect'?'248,113,113':mode==='agent'?'250,204,21':mode==='weave'?'34,211,238':'74,222,128';
+  const ekgBase=ekgH*0.6; // baseline below center (room for R spike above)
+  const ekgScale=65; // amplitude
+
+  // Faint grid lines (hospital monitor style)
+  ekgX.strokeStyle='rgba(255,255,255,0.015)';ekgX.lineWidth=0.5;
+  for(let gy=10;gy<ekgH;gy+=10){
+    ekgX.beginPath();ekgX.moveTo(0,gy);ekgX.lineTo(ekgW,gy);ekgX.stroke();
+  }
+
+  // Baseline
+  ekgX.beginPath();ekgX.moveTo(0,ekgBase);ekgX.lineTo(ekgW,ekgBase);
+  ekgX.strokeStyle='rgba(255,255,255,0.03)';ekgX.lineWidth=0.8;ekgX.stroke();
+
+  // Trail (full history, fading)
+  ekgX.beginPath();
+  for(let i=0;i<ekgHistory.length;i++){
+    const x=i*2,y=ekgBase-ekgHistory[i]*ekgScale;
+    i===0?ekgX.moveTo(x,y):ekgX.lineTo(x,y);
+  }
+  ekgX.strokeStyle=`rgba(${ec},0.25)`;ekgX.lineWidth=1;ekgX.stroke();
+
+  // Bright recent segment (last 80 points)
+  const seg=Math.max(0,ekgHistory.length-80);
+  ekgX.shadowColor=`rgba(${ec},0.5)`;ekgX.shadowBlur=6;
+  ekgX.beginPath();
+  for(let i=seg;i<ekgHistory.length;i++){
+    const x=i*2,y=ekgBase-ekgHistory[i]*ekgScale;
+    i===seg?ekgX.moveTo(x,y):ekgX.lineTo(x,y);
+  }
+  ekgX.strokeStyle=`rgba(${ec},0.6)`;ekgX.lineWidth=1.5;ekgX.stroke();
+
+  // Bright tip dot
+  if(ekgHistory.length>1){
+    const lx=(ekgHistory.length-1)*2;
+    const ly=ekgBase-ekgHistory[ekgHistory.length-1]*ekgScale;
+    ekgX.beginPath();ekgX.arc(lx,ly,2.5,0,Math.PI*2);
+    ekgX.fillStyle=`rgba(${ec},0.9)`;ekgX.shadowBlur=12;ekgX.fill();
+  }
+  ekgX.shadowBlur=0;
+
+  requestAnimationFrame(draw);
+}
+
+resize();addEventListener('resize',resize);
+requestAnimationFrame(draw);
+</script>
+
+</body>
+</html>
