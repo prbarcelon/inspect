@@ -22671,6 +22671,328 @@ Respond with ONLY a JSON object:
     return validated
 
 
+async def review_predictive_v1(pr_title: str, diff: str, triage_section: str, client, entities: list[dict] = None) -> list[str]:
+    """Strategy: predictive_v1 - hybrid_v13's 9 lenses + 1 caller-impact lens.
+    Uses inspect's graph-based dependent_entities (exact tree-sitter boundaries)
+    instead of grep-based caller extraction. Only the 10th lens is new."""
+    model = os.environ.get("REVIEW_MODEL", "gpt-5.2")
+    truncated = truncate_diff(diff, max_chars=65000)
+    code_triage = build_code_triage_v8b(entities) if entities else triage_section
+
+    diff_files = set()
+    for line in diff.split("\n"):
+        if line.startswith("+++ b/") or line.startswith("--- a/"):
+            path = line.split("/", 1)[1] if "/" in line else line[6:]
+            if path and path != "/dev/null":
+                diff_files.add(path)
+                diff_files.add(path.rsplit("/", 1)[-1])
+
+    async def run_lens(system_msg: str, prompt: str, temp: float, seed: int = 42) -> list[dict]:
+        try:
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=temp,
+                    seed=seed,
+                ),
+                timeout=180,
+            )
+            content = response.choices[0].message.content.strip()
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+                content = content.strip()
+            items = json.loads(content).get("issues", [])
+            result = []
+            for item in items:
+                if isinstance(item, str):
+                    result.append({"issue": item, "evidence": ""})
+                elif isinstance(item, dict):
+                    result.append({"issue": item.get("issue", str(item)), "evidence": item.get("evidence", "")})
+            return result
+        except Exception as e:
+            print(f"[lens-err:{e}]", end="", flush=True)
+            return []
+
+    # === Lenses 1-9: identical to hybrid_v13 ===
+    prompt_data = f"""You are a code reviewer specializing in DATA CORRECTNESS issues.
+
+PR Title: {pr_title}
+{code_triage}
+PR Diff:
+{truncated}
+
+Focus ONLY on: wrong translations, wrong constants/mappings/enum values, copy-paste errors, wrong key/field references, case sensitivity in comparisons, incorrect regex.
+Rules: ONLY concrete data issues. Be specific. Max 5 issues.
+Respond with ONLY: {{"issues": [{{"issue": "desc", "evidence": "code"}}]}}"""
+
+    prompt_concurrency = f"""You are a code reviewer specializing in CONCURRENCY and STATE bugs.
+
+PR Title: {pr_title}
+{code_triage}
+PR Diff:
+{truncated}
+
+Focus ONLY on: race conditions, missing locks/transactions, stale reads, process lifecycle bugs, cache inconsistency, feature flag inconsistency.
+Rules: ONLY issues with evidence in the diff. Be specific. Max 5 issues.
+Respond with ONLY: {{"issues": [{{"issue": "desc", "evidence": "code"}}]}}"""
+
+    prompt_contracts = f"""You are a code reviewer specializing in API CONTRACT violations.
+
+PR Title: {pr_title}
+{code_triage}
+PR Diff:
+{truncated}
+
+Focus ONLY on: missing abstract method implementations, wrong signatures/types, API breaking changes, wrong parameter order, key mismatches, missing React keys, import errors, method name typos breaking interfaces.
+Rules: ONLY verifiable issues. Be specific. Max 5 issues.
+Respond with ONLY: {{"issues": [{{"issue": "desc", "evidence": "code"}}]}}"""
+
+    prompt_security = f"""You are a security-focused code reviewer.
+
+PR Title: {pr_title}
+{code_triage}
+PR Diff:
+{truncated}
+
+Focus ONLY on: SSRF, XSS, injection, auth bypass, origin/referrer bypass, case sensitivity bypass in security comparisons, frame options misconfig, hardcoded secrets.
+Rules: ONLY real exploitable vulnerabilities. Be specific. Max 5 issues.
+Respond with ONLY: {{"issues": [{{"issue": "desc", "evidence": "code"}}]}}"""
+
+    prompt_typos_lens = f"""You are a code reviewer with exceptional attention to character-level detail.
+
+PR Title: {pr_title}
+{code_triage}
+PR Diff:
+{truncated}
+
+Focus ONLY on:
+- Method/function/variable name TYPOS causing runtime errors
+- Wrong language in locale/translation files
+- Missing required method suffixes (Rails '?', etc.)
+- Case sensitivity bugs in comparisons
+- Wrong vendor prefixes
+- Property/key name mismatches
+
+Rules: Character-level precision. Only if it causes runtime failure. Max 5 issues.
+Respond with ONLY: {{"issues": [{{"issue": "desc", "evidence": "code"}}]}}"""
+
+    prompt_runtime = f"""You are a code reviewer focused on RUNTIME FAILURES.
+
+PR Title: {pr_title}
+{code_triage}
+PR Diff:
+{truncated}
+
+For each changed function/class, ask: "What would happen if I ran this code?"
+
+Focus ONLY on:
+- Null/nil/undefined dereference
+- Missing abstract method implementations causing TypeError
+- Unreachable code branches
+- Infinite recursion without termination
+- Wrong error messages
+- Panic on nil in Go
+- Missing React keys
+
+Rules: RUNTIME behavior only. Only actual failures. Max 5 issues.
+Respond with ONLY: {{"issues": [{{"issue": "desc", "evidence": "code"}}]}}"""
+
+    prompt_general = PROMPT_DEEP.format(pr_title=pr_title, triage_section=code_triage, diff=truncated)
+    sys_precise = "You are a precise code reviewer. Only report real bugs you are confident about. Always respond with valid JSON."
+
+    # === Lens 10: Caller impact (NEW) ===
+    caller_context = ""
+    if entities:
+        # Select top 5 modified entities with highest dependent_count that have dependent_entities
+        candidates = [
+            e for e in entities
+            if e.get("change_type") in ("modified", "deleted")
+            and e.get("dependent_entities")
+        ]
+        candidates.sort(key=lambda e: e.get("dependent_count", 0), reverse=True)
+        candidates = candidates[:5]
+
+        if candidates:
+            parts = []
+            for e in candidates:
+                ename = e.get("entity_name", "?")
+                efile = e.get("file_path", "?")
+                etype = e.get("entity_type", "?")
+
+                before = (e.get("before_content") or "")[:1500]
+                after = (e.get("after_content") or "")[:1500]
+
+                dep_parts = []
+                for dep in e.get("dependent_entities", [])[:3]:
+                    dep_code = dep.get("content", "")[:1200]
+                    dep_parts.append(
+                        f"    Caller: {dep.get('entity_name', '?')} ({dep.get('entity_type', '?')}) in {dep.get('file_path', '?')}\n"
+                        f"    Depends on {dep.get('own_dependent_count', 0)} other entities, public={dep.get('is_public_api', False)}\n"
+                        f"    ```\n{dep_code}\n    ```"
+                    )
+
+                dep_section = "\n".join(dep_parts) if dep_parts else "    (no caller code available)"
+
+                parts.append(
+                    f"## {ename} ({etype}) in {efile}\n"
+                    f"BEFORE:\n```\n{before}\n```\n"
+                    f"AFTER:\n```\n{after}\n```\n"
+                    f"CALLERS/CONSUMERS:\n{dep_section}"
+                )
+
+            caller_context = "\n\n".join(parts)
+
+    # Build lens 10 prompt (only if we have caller context)
+    lens10_task = None
+    if caller_context:
+        prompt_caller = f"""You are a code reviewer analyzing whether changes break their CALLERS.
+
+PR Title: {pr_title}
+
+The following entities were modified. Below each is the BEFORE/AFTER code and the source code of functions that CALL or CONSUME it.
+
+{caller_context}
+
+For each changed entity, check:
+1. Does the change alter the return type, parameter signature, or behavior in a way that breaks any caller?
+2. Would any caller produce wrong results, crash, or hit an unhandled case after this change?
+3. Is there a missing update in a caller that should have been changed along with this entity?
+
+Rules:
+- ONLY report if a caller would actually break or produce wrong results.
+- NOT speculative. NOT style. NOT "could potentially".
+- Be specific: name the caller and what breaks.
+- Max 5 issues.
+
+Respond with ONLY: {{"issues": [{{"issue": "desc", "evidence": "code"}}]}}"""
+
+        lens10_task = run_lens(
+            "You are a caller-impact analyst. You check if code changes break their consumers. Always respond with valid JSON.",
+            prompt_caller, 0.0
+        )
+
+    # Run all lenses in parallel
+    tasks = [
+        run_lens("You are a data correctness reviewer. Always respond with valid JSON.", prompt_data, 0.0),
+        run_lens("You are a concurrency/state bug reviewer. Always respond with valid JSON.", prompt_concurrency, 0.0),
+        run_lens("You are an API contracts reviewer. Always respond with valid JSON.", prompt_contracts, 0.0),
+        run_lens("You are a security reviewer. Always respond with valid JSON.", prompt_security, 0.0),
+        run_lens("You are a character-level detail reviewer. Always respond with valid JSON.", prompt_typos_lens, 0.0),
+        run_lens("You are a runtime failure analyst. Always respond with valid JSON.", prompt_runtime, 0.0),
+        run_lens(sys_precise, prompt_general, 0.0),
+        run_lens(sys_precise, prompt_general, 0.3, seed=42),
+        run_lens(sys_precise, prompt_general, 0.3, seed=123),
+    ]
+    if lens10_task:
+        tasks.append(lens10_task)
+
+    results = await asyncio.gather(*tasks)
+
+    # Dedup
+    all_issues = []
+    existing_lower = set()
+    for pass_result in results:
+        for s in pass_result:
+            key = s["issue"].lower()[:80]
+            if key not in existing_lower:
+                all_issues.append(s)
+                existing_lower.add(key)
+
+    if not all_issues:
+        return []
+
+    # Phantom file filter
+    if diff_files:
+        code_exts = {".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".rb", ".c", ".cpp", ".cs", ".swift", ".kt", ".scala", ".hbs", ".erb", ".ex", ".exs", ".hcl"}
+        filtered = []
+        dropped = 0
+        for s in all_issues:
+            text = s["issue"].lower()
+            has_phantom_file = False
+            for word in text.replace("/", " / ").split():
+                if any(word.endswith(ext) for ext in code_exts):
+                    base = word.rsplit("/", 1)[-1]
+                    if base not in {f.lower().rsplit("/", 1)[-1] for f in diff_files}:
+                        has_phantom_file = True
+                        break
+            if has_phantom_file:
+                dropped += 1
+            else:
+                filtered.append(s)
+        if dropped:
+            print(f"[-{dropped}file]", end="", flush=True)
+        all_issues = filtered
+
+    if not all_issues:
+        return []
+
+    print(f"[{len(all_issues)}raw]", end="", flush=True)
+
+    # Validation (same as hybrid_v13, no caller code in validation)
+    candidates_text = "\n".join(
+        f"{i+1}. {s['issue']}" + (f"\n   Evidence: {s['evidence']}" if s['evidence'] else "")
+        for i, s in enumerate(all_issues)
+    )
+
+    entity_context = build_entity_verification_context(entities, [s["issue"] for s in all_issues]) if entities else ""
+
+    refine_prompt = f"""You are a senior code reviewer doing final validation. You have the PR diff and candidate issues.
+
+PR Title: {pr_title}
+{entity_context}
+PR Diff (for verification):
+{truncated}
+
+Candidate Issues:
+{candidates_text}
+
+For each candidate, verify against the actual diff:
+1. Can you find the specific code that's buggy? If yes, keep it.
+2. Is this a real bug that would cause incorrect behavior in production? If yes, keep it.
+3. Is this about deleted/removed code being replaced? If so, DROP it.
+4. Is this speculative or theoretical ("could potentially...")? If so, DROP it.
+5. Is this about style, naming conventions, or missing tests? If so, DROP it.
+
+Return ONLY the issues that are verified real bugs with evidence in the diff.
+
+Respond with ONLY a JSON object:
+{{"issues": ["verified issue 1", "verified issue 2", ...]}}"""
+
+    try:
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a precise reviewer. Verify each issue against the actual diff. Only keep confirmed bugs. Always respond with valid JSON."},
+                    {"role": "user", "content": refine_prompt},
+                ],
+                temperature=0.0,
+                seed=42,
+            ),
+            timeout=180,
+        )
+        content = response.choices[0].message.content.strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+            content = content.strip()
+        validated = json.loads(content).get("issues", [])
+    except Exception as e:
+        print(f"[val-err:{e.__class__.__name__}]", end="", flush=True)
+        validated = [s["issue"] for s in all_issues[:5]]
+
+    validated = validated[:7]
+    print(f"[{len(validated)}fin]", end="", flush=True)
+    return validated
+
+
 async def review_hybrid_v12(pr_title: str, diff: str, triage_section: str, client, entities: list[dict] = None) -> list[str]:
     """Strategy: hybrid_v12 - v10 with ONLY v3 scorer + noise filter.
     v11 showed that review hints and extra entities hurt precision (+10 FP).
@@ -25589,9 +25911,9 @@ async def step_review(strategy: str = "precise"):
         model = os.environ.get("REVIEW_MODEL", "gpt-5.2")
     print(f"Strategy: {strategy}, Model: {model}, Provider: {provider}")
 
-    strategies = {"precise": review_precise, "two_pass": review_two_pass, "targeted": review_targeted, "targeted_validated": review_targeted_validated, "entity_focused": review_entity_focused, "consensus": review_consensus, "deep": review_deep, "deep_v2": review_deep_v2, "deep_v3": review_deep_v3, "deep_v4": review_deep_v4, "deep_v5": review_deep_v5, "deep_v6": review_deep_v6, "deep_v7": review_deep_v7, "deep_v8": review_deep_v8, "deep_v9": review_deep_v9, "deep_v10": review_deep_v10, "deep_v11": review_deep_v11, "deep_v12": review_deep_v12, "deep_v13": review_deep_v13, "deep_v14": review_deep_v14, "deep_v17": review_deep_v17, "deep_v18": review_deep_v18, "deep_v19": review_deep_v19, "deep_v20": review_deep_v20, "deep_v21": review_deep_v21, "deep_v22": review_deep_v22, "deep_v23": review_deep_v23, "deep_v24": review_deep_v24, "deep_v25": review_deep_v25, "deep_v26": review_deep_v26, "deep_v27": review_deep_v27, "deep_v28": review_deep_v28, "deep_v29": review_deep_v29, "deep_v30": review_deep_v30, "deep_v31": review_deep_v31, "deep_v32": review_deep_v32, "deep_v33": review_deep_v33, "deep_v34": review_deep_v34, "deep_v35": review_deep_v35, "deep_v36": review_deep_v36, "deep_v38": review_deep_v38, "deep_v40": review_deep_v40, "deep_v50": review_deep_v50, "deep_v60": review_deep_v60, "deep_v70": review_deep_v70, "deep_v80": review_deep_v80, "deep_v90": review_deep_v90, "deep_v100": review_deep_v100, "deep_v110": review_deep_v110, "deep_v120": review_deep_v120, "deep_v130": review_deep_v130, "deep_v140": review_deep_v140, "deep_v150": review_deep_v150, "deep_v160": review_deep_v160, "deep_v170": review_deep_v170, "deep_v180": review_deep_v180, "deep_v190": review_deep_v190, "deep_v200": review_deep_v200, "deep_v210": review_deep_v210, "deep_v220": review_deep_v220, "deep_v230": review_deep_v230, "deep_v240": review_deep_v240, "deep_v250": review_deep_v250, "deep_v260": review_deep_v260, "deep_v270": review_deep_v270, "deep_v280": review_deep_v280, "deterministic_v1": review_deterministic_v1, "deterministic_v2": review_deterministic_v2, "deterministic_v3": review_deterministic_v3, "deterministic_v4": review_deterministic_v4, "entity_only_v1": review_entity_only_v1, "entity_only_v2": review_entity_only_v2, "annotated_v1": review_annotated_v1, "hybrid_v1": review_hybrid_v1, "hybrid_v2": review_hybrid_v2, "hybrid_v3": review_hybrid_v3, "hybrid_v4": review_hybrid_v4, "hybrid_v5": review_hybrid_v5, "hybrid_v6": review_hybrid_v6, "hybrid_v7": review_hybrid_v7, "hybrid_v8": review_hybrid_v8, "hybrid_v9": review_hybrid_v9, "hybrid_v10": review_hybrid_v10, "hybrid_v11": review_hybrid_v11, "hybrid_v12": review_hybrid_v12, "hybrid_v13": review_hybrid_v13, "api": review_api}
+    strategies = {"precise": review_precise, "two_pass": review_two_pass, "targeted": review_targeted, "targeted_validated": review_targeted_validated, "entity_focused": review_entity_focused, "consensus": review_consensus, "deep": review_deep, "deep_v2": review_deep_v2, "deep_v3": review_deep_v3, "deep_v4": review_deep_v4, "deep_v5": review_deep_v5, "deep_v6": review_deep_v6, "deep_v7": review_deep_v7, "deep_v8": review_deep_v8, "deep_v9": review_deep_v9, "deep_v10": review_deep_v10, "deep_v11": review_deep_v11, "deep_v12": review_deep_v12, "deep_v13": review_deep_v13, "deep_v14": review_deep_v14, "deep_v17": review_deep_v17, "deep_v18": review_deep_v18, "deep_v19": review_deep_v19, "deep_v20": review_deep_v20, "deep_v21": review_deep_v21, "deep_v22": review_deep_v22, "deep_v23": review_deep_v23, "deep_v24": review_deep_v24, "deep_v25": review_deep_v25, "deep_v26": review_deep_v26, "deep_v27": review_deep_v27, "deep_v28": review_deep_v28, "deep_v29": review_deep_v29, "deep_v30": review_deep_v30, "deep_v31": review_deep_v31, "deep_v32": review_deep_v32, "deep_v33": review_deep_v33, "deep_v34": review_deep_v34, "deep_v35": review_deep_v35, "deep_v36": review_deep_v36, "deep_v38": review_deep_v38, "deep_v40": review_deep_v40, "deep_v50": review_deep_v50, "deep_v60": review_deep_v60, "deep_v70": review_deep_v70, "deep_v80": review_deep_v80, "deep_v90": review_deep_v90, "deep_v100": review_deep_v100, "deep_v110": review_deep_v110, "deep_v120": review_deep_v120, "deep_v130": review_deep_v130, "deep_v140": review_deep_v140, "deep_v150": review_deep_v150, "deep_v160": review_deep_v160, "deep_v170": review_deep_v170, "deep_v180": review_deep_v180, "deep_v190": review_deep_v190, "deep_v200": review_deep_v200, "deep_v210": review_deep_v210, "deep_v220": review_deep_v220, "deep_v230": review_deep_v230, "deep_v240": review_deep_v240, "deep_v250": review_deep_v250, "deep_v260": review_deep_v260, "deep_v270": review_deep_v270, "deep_v280": review_deep_v280, "deterministic_v1": review_deterministic_v1, "deterministic_v2": review_deterministic_v2, "deterministic_v3": review_deterministic_v3, "deterministic_v4": review_deterministic_v4, "entity_only_v1": review_entity_only_v1, "entity_only_v2": review_entity_only_v2, "annotated_v1": review_annotated_v1, "hybrid_v1": review_hybrid_v1, "hybrid_v2": review_hybrid_v2, "hybrid_v3": review_hybrid_v3, "hybrid_v4": review_hybrid_v4, "hybrid_v5": review_hybrid_v5, "hybrid_v6": review_hybrid_v6, "hybrid_v7": review_hybrid_v7, "hybrid_v8": review_hybrid_v8, "hybrid_v9": review_hybrid_v9, "hybrid_v10": review_hybrid_v10, "hybrid_v11": review_hybrid_v11, "hybrid_v12": review_hybrid_v12, "hybrid_v13": review_hybrid_v13, "predictive_v1": review_predictive_v1, "api": review_api}
     review_fn = strategies.get(strategy, review_precise)
-    needs_entities = strategy in ("entity_focused", "deep", "deep_v2", "deep_v3", "deep_v4", "deep_v5", "deep_v6", "deep_v7", "deep_v8", "deep_v9", "deep_v10", "deep_v11", "deep_v12", "deep_v13", "deep_v14", "deep_v17", "deep_v18", "deep_v19", "deep_v20", "deep_v21", "deep_v22", "deep_v23", "deep_v24", "deep_v25", "deep_v26", "deep_v27", "deep_v28", "deep_v29", "deep_v30", "deep_v31", "deep_v32", "deep_v33", "deep_v34", "deep_v35", "deep_v36", "deep_v38", "deep_v40", "deep_v50", "deep_v60", "deep_v70", "deep_v80", "deep_v90", "deep_v100", "deep_v110", "deep_v120", "deep_v130", "deep_v140", "deep_v150", "deep_v160", "deep_v170", "deep_v180", "deep_v190", "deep_v200", "deep_v210", "deep_v220", "deep_v230", "deep_v240", "deep_v250", "deep_v260", "deep_v270", "deep_v280", "deterministic_v1", "deterministic_v2", "deterministic_v3", "deterministic_v4", "entity_only_v1", "entity_only_v2", "annotated_v1", "hybrid_v1", "hybrid_v2", "hybrid_v3", "hybrid_v4", "hybrid_v5", "hybrid_v6", "hybrid_v7", "hybrid_v8", "hybrid_v9", "hybrid_v10", "hybrid_v11", "hybrid_v12", "hybrid_v13")
+    needs_entities = strategy in ("entity_focused", "deep", "deep_v2", "deep_v3", "deep_v4", "deep_v5", "deep_v6", "deep_v7", "deep_v8", "deep_v9", "deep_v10", "deep_v11", "deep_v12", "deep_v13", "deep_v14", "deep_v17", "deep_v18", "deep_v19", "deep_v20", "deep_v21", "deep_v22", "deep_v23", "deep_v24", "deep_v25", "deep_v26", "deep_v27", "deep_v28", "deep_v29", "deep_v30", "deep_v31", "deep_v32", "deep_v33", "deep_v34", "deep_v35", "deep_v36", "deep_v38", "deep_v40", "deep_v50", "deep_v60", "deep_v70", "deep_v80", "deep_v90", "deep_v100", "deep_v110", "deep_v120", "deep_v130", "deep_v140", "deep_v150", "deep_v160", "deep_v170", "deep_v180", "deep_v190", "deep_v200", "deep_v210", "deep_v220", "deep_v230", "deep_v240", "deep_v250", "deep_v260", "deep_v270", "deep_v280", "deterministic_v1", "deterministic_v2", "deterministic_v3", "deterministic_v4", "entity_only_v1", "entity_only_v2", "annotated_v1", "hybrid_v1", "hybrid_v2", "hybrid_v3", "hybrid_v4", "hybrid_v5", "hybrid_v6", "hybrid_v7", "hybrid_v8", "hybrid_v9", "hybrid_v10", "hybrid_v11", "hybrid_v12", "hybrid_v13", "predictive_v1")
     needs_deps = strategy in ("deep_v80", "deep_v90", "deep_v100", "deep_v110", "deep_v120")
 
     # Build dependency cache if needed
@@ -25872,7 +26194,7 @@ def ensure_repo_clone(owner_repo: str) -> Path:
     return repo_dir
 
 
-def run_inspect_local(owner_repo: str, pr_number: int, repo_dir: Path) -> dict | None:
+def run_inspect_local(owner_repo: str, pr_number: int, repo_dir: Path, include_dependents: bool = False) -> dict | None:
     """Run inspect diff locally with full graph analysis.
     Uses merge-base to get the same diff scope as GitHub's PR view.
     Filters entities using GitHub's PR file list to avoid merge-base artifacts."""
@@ -25917,8 +26239,11 @@ def run_inspect_local(owner_repo: str, pr_number: int, repo_dir: Path) -> dict |
         # Use base_sha..head_sha (not merge-base). The PR file filter handles scoping.
         # base_sha is the base branch HEAD, so files that exist there correctly show as
         # "modified" instead of "added" (which happened with old merge-base).
+        cmd = [str(INSPECT_BIN), "diff", f"{base_sha}..{head_sha}", "-C", str(repo_dir), "--format", "json"]
+        if include_dependents:
+            cmd.append("--dependents")
         result = subprocess.run(
-            [str(INSPECT_BIN), "diff", f"{base_sha}..{head_sha}", "-C", str(repo_dir), "--format", "json"],
+            cmd,
             capture_output=True, text=True, timeout=300,
         )
         if result.returncode != 0:
@@ -26014,6 +26339,7 @@ def step_triage():
     Use --force to re-run all PRs."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     force = "--force" in sys.argv
+    include_dependents = "--dependents" in sys.argv
 
     # Parse mode
     mode = "local"
@@ -26061,7 +26387,7 @@ def step_triage():
             # Step 2: Local analysis for graph data (also serves as fallback)
             try:
                 repo_dir = ensure_repo_clone(owner_repo)
-                local_result = run_inspect_local(owner_repo, pr_number, repo_dir)
+                local_result = run_inspect_local(owner_repo, pr_number, repo_dir, include_dependents=include_dependents)
                 local_entities = local_result.get("entity_reviews", []) if local_result else []
             except (subprocess.CalledProcessError, Exception) as e:
                 local_entities = []
@@ -26098,14 +26424,16 @@ def step_triage():
                 print(f"clone failed: {e}")
                 continue
 
-            result = run_inspect_local(owner_repo, pr_number, repo_dir)
+            result = run_inspect_local(owner_repo, pr_number, repo_dir, include_dependents=include_dependents)
             if result:
                 entity_count = len(result.get("entity_reviews", []))
                 has_graph = any(
                     e.get("blast_radius", 0) > 0 or e.get("dependent_count", 0) > 0
                     for e in result.get("entity_reviews", [])
                 )
-                print(f"{entity_count} entities {'(with graph)' if has_graph else '(no graph)'}")
+                dep_count = sum(len(e.get("dependent_entities", [])) for e in result.get("entity_reviews", []))
+                dep_msg = f"+{dep_count}deps" if dep_count else ""
+                print(f"{entity_count} entities {'(with graph)' if has_graph else '(no graph)'}{dep_msg}")
                 results[url] = result
             else:
                 print("failed")

@@ -113,6 +113,19 @@ fn change_type_weight(ct: ChangeType) -> f64 {
     }
 }
 
+/// Rank a dependent entity for inclusion in dependent_entities.
+/// Higher score = more important to show to the LLM.
+pub fn rank_dependent(own_dependent_count: usize, is_public: bool, is_cross_file: bool) -> f64 {
+    let mut score = (1.0 + own_dependent_count as f64).ln() * 0.5;
+    if is_public {
+        score += 0.3;
+    }
+    if is_cross_file {
+        score += 0.2;
+    }
+    score
+}
+
 /// Detect if an entity is a public API based on name and type patterns.
 pub fn is_public_api(entity_type: &str, entity_name: &str, content: Option<&str>) -> bool {
     // Check content for explicit pub/export markers
@@ -174,6 +187,7 @@ mod tests {
             after_content: None,
             dependent_names: vec![],
             dependency_names: vec![],
+            dependent_entities: vec![],
         }
     }
 

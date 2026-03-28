@@ -10,12 +10,41 @@ use sem_core::parser::plugins::create_default_registry;
 
 use crate::classify::classify_change;
 use crate::github::FilePair;
-use crate::risk::{compute_risk_score, is_public_api, score_to_level};
+use crate::risk::{compute_risk_score, is_public_api, rank_dependent, score_to_level};
 use crate::types::*;
 use crate::untangle::untangle;
 
+/// Options for controlling analysis behavior.
+pub struct AnalyzeOptions {
+    /// Include full source code of dependent entities (callers/consumers).
+    pub include_dependent_code: bool,
+    /// Maximum number of dependents to include per changed entity.
+    pub max_dependents_per_entity: usize,
+    /// Skip dependent entities larger than this many lines.
+    pub max_dependent_lines: usize,
+}
+
+impl Default for AnalyzeOptions {
+    fn default() -> Self {
+        Self {
+            include_dependent_code: false,
+            max_dependents_per_entity: 5,
+            max_dependent_lines: 100,
+        }
+    }
+}
+
 /// Analyze a diff scope and produce a ReviewResult.
 pub fn analyze(repo_path: &Path, scope: DiffScope) -> Result<ReviewResult, AnalyzeError> {
+    analyze_with_options(repo_path, scope, &AnalyzeOptions::default())
+}
+
+/// Analyze with configurable options (e.g. dependent entity code).
+pub fn analyze_with_options(
+    repo_path: &Path,
+    scope: DiffScope,
+    options: &AnalyzeOptions,
+) -> Result<ReviewResult, AnalyzeError> {
     use std::time::Instant;
 
     let total_start = Instant::now();
@@ -106,6 +135,7 @@ pub fn analyze(repo_path: &Path, scope: DiffScope) -> Result<ReviewResult, Analy
             after_content: change.after_content.clone(),
             dependent_names,
             dependency_names,
+            dependent_entities: vec![],
         };
 
         review.risk_score = compute_risk_score(&review, total_graph_entities);
@@ -123,6 +153,14 @@ pub fn analyze(repo_path: &Path, scope: DiffScope) -> Result<ReviewResult, Analy
         }
 
         reviews.push(review);
+    }
+
+    // Phase 4b: Collect dependent entity code if requested
+    if options.include_dependent_code {
+        for review in &mut reviews {
+            review.dependent_entities =
+                collect_dependent_code(&graph, &review.entity_id, repo_path, options);
+        }
     }
 
     reviews.sort_by(|a, b| b.risk_score.partial_cmp(&a.risk_score).unwrap());
@@ -235,6 +273,7 @@ pub fn analyze_remote(file_pairs: &[FilePair]) -> Result<ReviewResult, AnalyzeEr
             after_content: change.after_content.clone(),
             dependent_names: vec![],
             dependency_names: vec![],
+            dependent_entities: vec![],
         };
 
         review.risk_score = compute_risk_score(&review, 0);
@@ -331,6 +370,81 @@ pub(crate) fn compute_stats(reviews: &[EntityReview]) -> ReviewStats {
         by_classification: by_classification,
         by_change_type: by_change,
     }
+}
+
+/// Collect full source code of the top dependent entities for a changed entity.
+/// Uses the entity graph to get precise function boundaries via tree-sitter.
+fn collect_dependent_code(
+    graph: &EntityGraph,
+    entity_id: &str,
+    repo_path: &Path,
+    options: &AnalyzeOptions,
+) -> Vec<DependentEntity> {
+    let dependents = graph.get_dependents(entity_id);
+    if dependents.is_empty() {
+        return vec![];
+    }
+
+    let source_file = graph
+        .entities
+        .get(entity_id)
+        .map(|e| e.file_path.as_str())
+        .unwrap_or("");
+
+    // Score and rank dependents
+    let mut scored: Vec<(&sem_core::parser::graph::EntityInfo, f64)> = dependents
+        .iter()
+        .map(|dep| {
+            let own_dep_count = graph.get_dependents(&dep.id).len();
+            let content_hint = std::fs::read_to_string(repo_path.join(&dep.file_path))
+                .ok()
+                .and_then(|c| {
+                    let lines: Vec<&str> = c.lines().collect();
+                    lines.get(dep.start_line.saturating_sub(1)).map(|l| l.to_string())
+                });
+            let is_pub = is_public_api(&dep.entity_type, &dep.name, content_hint.as_deref());
+            let is_cross_file = dep.file_path != source_file;
+            let score = rank_dependent(own_dep_count, is_pub, is_cross_file);
+            (*dep, score)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    scored.truncate(options.max_dependents_per_entity);
+
+    scored
+        .into_iter()
+        .filter_map(|(dep, _score)| {
+            let line_count = dep.end_line.saturating_sub(dep.start_line) + 1;
+            if line_count > options.max_dependent_lines {
+                return None;
+            }
+
+            let file_content = std::fs::read_to_string(repo_path.join(&dep.file_path)).ok()?;
+            let lines: Vec<&str> = file_content.lines().collect();
+            let start = dep.start_line.saturating_sub(1);
+            let end = dep.end_line.min(lines.len());
+            if start >= lines.len() || start >= end {
+                return None;
+            }
+            let content = lines[start..end].join("\n");
+
+            let own_dep_count = graph.get_dependents(&dep.id).len();
+            let first_line = lines.get(start).copied().unwrap_or("");
+            let is_pub = is_public_api(&dep.entity_type, &dep.name, Some(first_line));
+
+            Some(DependentEntity {
+                entity_name: dep.name.clone(),
+                entity_type: dep.entity_type.clone(),
+                file_path: dep.file_path.clone(),
+                start_line: dep.start_line,
+                end_line: dep.end_line,
+                content,
+                own_dependent_count: own_dep_count,
+                is_public_api: is_pub,
+            })
+        })
+        .collect()
 }
 
 /// List all tracked source files in the repo via `git ls-files`.

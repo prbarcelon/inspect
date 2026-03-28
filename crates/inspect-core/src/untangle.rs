@@ -170,6 +170,7 @@ mod tests {
             after_content: None,
             dependent_names: vec![],
             dependency_names: vec![],
+            dependent_entities: vec![],
         }
     }
 

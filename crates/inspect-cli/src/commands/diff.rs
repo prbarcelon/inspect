@@ -5,7 +5,7 @@ use sem_core::git::types::DiffScope;
 
 use crate::formatters;
 use crate::OutputFormat;
-use inspect_core::analyze::analyze;
+use inspect_core::analyze::{analyze_with_options, AnalyzeOptions};
 use inspect_core::types::RiskLevel;
 
 #[derive(Args)]
@@ -25,6 +25,10 @@ pub struct DiffArgs {
     #[arg(long)]
     pub context: bool,
 
+    /// Include full source code of dependent entities (callers/consumers)
+    #[arg(long)]
+    pub dependents: bool,
+
     /// Repository path
     #[arg(short = 'C', long, default_value = ".")]
     pub repo: PathBuf,
@@ -34,7 +38,12 @@ pub fn run(args: DiffArgs) {
     let scope = parse_scope(&args.target);
     let repo = args.repo.canonicalize().unwrap_or(args.repo.clone());
 
-    match analyze(&repo, scope) {
+    let options = AnalyzeOptions {
+        include_dependent_code: args.dependents,
+        ..AnalyzeOptions::default()
+    };
+
+    match analyze_with_options(&repo, scope, &options) {
         Ok(mut result) => {
             // Filter by min risk if specified
             if let Some(ref min) = args.min_risk {
