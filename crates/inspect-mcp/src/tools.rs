@@ -93,6 +93,18 @@ pub struct ReviewComment {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PredictParams {
+    #[schemars(description = "Absolute path to the git repository")]
+    pub repo_path: String,
+    #[schemars(description = "What to analyze: a commit ref (e.g. 'HEAD~1'), a range ('main..feature'), or 'working' for uncommitted changes")]
+    pub target: String,
+    #[schemars(description = "Minimum risk level to include: 'low', 'medium', 'high', or 'critical'")]
+    pub min_risk: Option<String>,
+    #[schemars(description = "Maximum at-risk entities per changed entity (default: 10)")]
+    pub max_per_change: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchParams {
     #[schemars(description = "GitHub repository in owner/repo format")]
     pub repo: String,

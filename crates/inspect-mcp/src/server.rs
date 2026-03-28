@@ -10,6 +10,7 @@ use sem_core::git::types::DiffScope;
 use tokio::sync::Mutex;
 
 use inspect_core::analyze::{analyze, analyze_remote, AnalyzeError};
+use inspect_core::predict::{predict_with_options, PredictOptions};
 use inspect_core::github::{CreateReview, GitHubClient, ReviewCommentInput};
 use inspect_core::noise::is_noise_file;
 use inspect_core::patch::{commentable_lines, parse_patch};
@@ -674,6 +675,85 @@ impl InspectServer {
             serde_json::to_string_pretty(&output).unwrap_or_default(),
         )]))
     }
+
+    #[tool(description = "Predict which unchanged entities are at risk of breaking from a set of changes. Shows the blast zone: callers and consumers that may silently break. Returns threats (changed entities) with their at-risk dependents sorted by risk.")]
+    async fn inspect_predict(
+        &self,
+        Parameters(params): Parameters<PredictParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let repo = PathBuf::from(&params.repo_path);
+        let scope = parse_scope(&params.target);
+
+        let min_risk = params
+            .min_risk
+            .as_deref()
+            .map(parse_risk_level)
+            .unwrap_or(RiskLevel::Low);
+
+        let max_per_change = params.max_per_change.unwrap_or(10);
+
+        let options = PredictOptions {
+            max_at_risk_per_change: max_per_change,
+            min_risk,
+            ..PredictOptions::default()
+        };
+
+        let result = tokio::task::spawn_blocking(move || predict_with_options(&repo, scope, &options))
+            .await
+            .map_err(|e| internal_err(format!("spawn_blocking failed: {}", e)))?
+            .map_err(internal_err)?;
+
+        let threats: Vec<serde_json::Value> = result
+            .threats
+            .iter()
+            .map(|t| {
+                let at_risk: Vec<serde_json::Value> = t
+                    .at_risk
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "name": e.entity_name,
+                            "type": e.entity_type,
+                            "file": e.file_path,
+                            "lines": format!("{}-{}", e.start_line, e.end_line),
+                            "risk": format!("{}", e.risk_level),
+                            "score": format!("{:.2}", e.risk_score),
+                            "own_dependents": e.own_dependent_count,
+                            "public_api": e.is_public_api,
+                            "cross_file": e.is_cross_file,
+                        })
+                    })
+                    .collect();
+
+                serde_json::json!({
+                    "changed_entity": t.entity_name,
+                    "type": t.entity_type,
+                    "file": t.file_path,
+                    "change_type": format!("{:?}", t.change_type).to_lowercase(),
+                    "classification": format!("{}", t.classification),
+                    "at_risk_count": t.at_risk.len(),
+                    "at_risk": at_risk,
+                })
+            })
+            .collect();
+
+        let output = serde_json::json!({
+            "total_changes": result.total_changes,
+            "total_at_risk": result.total_at_risk,
+            "at_risk_by_level": {
+                "critical": result.at_risk_by_level.critical,
+                "high": result.at_risk_by_level.high,
+                "medium": result.at_risk_by_level.medium,
+                "low": result.at_risk_by_level.low,
+            },
+            "threats": threats,
+            "timing_ms": result.timing.total_ms,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
+        )]))
+    }
 }
 
 struct FileRisk {
@@ -691,7 +771,8 @@ impl ServerHandler for InspectServer {
         ServerInfo {
             instructions: Some(
                 "Entity-level code review triage server. For local repos: use inspect_triage as \
-                 the primary entry point. For remote GitHub PRs: use inspect_pr (no clone needed). \
+                 the primary entry point, or inspect_predict to find unchanged code at risk of breaking. \
+                 For remote GitHub PRs: use inspect_pr (no clone needed). \
                  Drill down with inspect_entity, inspect_group, or inspect_file. Post reviews with \
                  inspect_post_review. Search PR files with inspect_search."
                     .into(),

@@ -4,6 +4,7 @@ pub mod github;
 pub mod llm;
 pub mod noise;
 pub mod patch;
+pub mod predict;
 pub mod risk;
 pub mod search;
 pub mod types;

@@ -26,6 +26,8 @@ enum Commands {
     Comment(commands::comment::CommentArgs),
     /// Search PR files (and optionally the codebase) for a pattern
     Grep(commands::grep::GrepArgs),
+    /// Predict which unchanged entities are at risk of breaking
+    Predict(commands::predict::PredictArgs),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -46,5 +48,6 @@ async fn main() {
         Commands::Review(args) => commands::review::run(args).await,
         Commands::Comment(args) => commands::comment::run(args).await,
         Commands::Grep(args) => commands::grep::run(args).await,
+        Commands::Predict(args) => commands::predict::run(args),
     }
 }

@@ -126,6 +126,51 @@ pub fn rank_dependent(own_dependent_count: usize, is_public: bool, is_cross_file
     score
 }
 
+/// Score an unchanged entity by its exposure to a changed entity.
+/// Used by predict to rank which callers/consumers are most at risk.
+pub fn predict_risk_score(
+    own_dependent_count: usize,
+    is_public_api: bool,
+    is_cross_file: bool,
+    source_classification: ChangeClassification,
+    source_change_type: ChangeType,
+) -> f64 {
+    let mut score = 0.0;
+
+    // Hub callers are riskier (log-scaled)
+    score += (1.0 + own_dependent_count as f64).ln() * 0.25;
+
+    // Public API exposure
+    if is_public_api {
+        score += 0.20;
+    }
+
+    // Cross-file breaks are harder to spot
+    if is_cross_file {
+        score += 0.15;
+    }
+
+    // How threatening is the source change?
+    score += match source_classification {
+        ChangeClassification::Functional
+        | ChangeClassification::SyntaxFunctional
+        | ChangeClassification::TextSyntaxFunctional
+        | ChangeClassification::TextFunctional => 0.25,
+        ChangeClassification::Syntax | ChangeClassification::TextSyntax => 0.15,
+        ChangeClassification::Text => 0.0,
+    };
+
+    // Deleted source = guaranteed breakage
+    score += match source_change_type {
+        ChangeType::Deleted => 0.25,
+        ChangeType::Modified => 0.10,
+        ChangeType::Renamed => 0.05,
+        _ => 0.0,
+    };
+
+    score.min(1.0)
+}
+
 /// Detect if an entity is a public API based on name and type patterns.
 pub fn is_public_api(entity_type: &str, entity_name: &str, content: Option<&str>) -> bool {
     // Check content for explicit pub/export markers

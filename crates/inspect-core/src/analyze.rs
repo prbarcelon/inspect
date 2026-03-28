@@ -34,6 +34,74 @@ impl Default for AnalyzeOptions {
     }
 }
 
+/// Shared context from Phases 1-3: diff, file listing, graph build.
+/// Used by both analyze and predict.
+pub(crate) struct AnalysisContext {
+    pub graph: EntityGraph,
+    pub changes: Vec<sem_core::model::change::SemanticChange>,
+    pub changed_entity_ids: HashSet<String>,
+    pub total_graph_entities: usize,
+    pub diff_ms: u64,
+    pub list_files_ms: u64,
+    pub file_count: usize,
+    pub graph_build_ms: u64,
+}
+
+/// Run Phases 1-3: entity diff, file listing, graph build.
+/// Returns None if there are no changes.
+pub(crate) fn build_context(
+    repo_path: &Path,
+    scope: DiffScope,
+) -> Result<Option<AnalysisContext>, AnalyzeError> {
+    use std::time::Instant;
+
+    let git = GitBridge::open(repo_path).map_err(|e| AnalyzeError::Git(e.to_string()))?;
+    let registry = create_default_registry();
+
+    let file_changes = git
+        .get_changed_files(&scope)
+        .map_err(|e| AnalyzeError::Git(e.to_string()))?;
+
+    if file_changes.is_empty() {
+        return Ok(None);
+    }
+
+    // Phase 1: Compute entity-level diff
+    let diff_start = Instant::now();
+    let diff = compute_semantic_diff(&file_changes, &registry, None, None);
+    let diff_ms = diff_start.elapsed().as_millis() as u64;
+
+    if diff.changes.is_empty() {
+        return Ok(None);
+    }
+
+    // Phase 2: List all source files in the repo
+    let list_start = Instant::now();
+    let all_files = list_source_files(repo_path)?;
+    let file_count = all_files.len();
+    let list_files_ms = list_start.elapsed().as_millis() as u64;
+
+    let changed_entity_ids: HashSet<String> =
+        diff.changes.iter().map(|c| c.entity_id.clone()).collect();
+
+    // Phase 3: Build entity graph from ALL source files (parallel via rayon)
+    let graph_start = Instant::now();
+    let graph = EntityGraph::build(git.repo_root(), &all_files, &registry);
+    let graph_build_ms = graph_start.elapsed().as_millis() as u64;
+    let total_graph_entities = graph.entities.len();
+
+    Ok(Some(AnalysisContext {
+        graph,
+        changes: diff.changes,
+        changed_entity_ids,
+        total_graph_entities,
+        diff_ms,
+        list_files_ms,
+        file_count,
+        graph_build_ms,
+    }))
+}
+
 /// Analyze a diff scope and produce a ReviewResult.
 pub fn analyze(repo_path: &Path, scope: DiffScope) -> Result<ReviewResult, AnalyzeError> {
     analyze_with_options(repo_path, scope, &AnalyzeOptions::default())
@@ -48,40 +116,22 @@ pub fn analyze_with_options(
     use std::time::Instant;
 
     let total_start = Instant::now();
-    let git = GitBridge::open(repo_path).map_err(|e| AnalyzeError::Git(e.to_string()))?;
-    let registry = create_default_registry();
 
-    // Get file changes
-    let file_changes = git
-        .get_changed_files(&scope)
-        .map_err(|e| AnalyzeError::Git(e.to_string()))?;
+    let ctx = match build_context(repo_path, scope)? {
+        Some(ctx) => ctx,
+        None => return Ok(empty_result()),
+    };
 
-    if file_changes.is_empty() {
-        return Ok(empty_result());
-    }
-
-    // Phase 1: Compute entity-level diff
-    let diff_start = Instant::now();
-    let diff = compute_semantic_diff(&file_changes, &registry, None, None);
-    let diff_ms = diff_start.elapsed().as_millis() as u64;
-
-    if diff.changes.is_empty() {
-        return Ok(empty_result());
-    }
-
-    // Phase 2: List all source files in the repo
-    let list_start = Instant::now();
-    let all_files = list_source_files(repo_path)?;
-    let file_count = all_files.len();
-    let list_files_ms = list_start.elapsed().as_millis() as u64;
-
-    let changed_entity_ids: HashSet<&str> = diff.changes.iter().map(|c| c.entity_id.as_str()).collect();
-
-    // Phase 3: Build entity graph from ALL source files (parallel via rayon)
-    let graph_start = Instant::now();
-    let graph = EntityGraph::build(git.repo_root(), &all_files, &registry);
-    let graph_build_ms = graph_start.elapsed().as_millis() as u64;
-    let total_graph_entities = graph.entities.len();
+    let AnalysisContext {
+        graph,
+        changes,
+        changed_entity_ids,
+        total_graph_entities,
+        diff_ms,
+        list_files_ms,
+        file_count,
+        graph_build_ms,
+    } = ctx;
 
     // Phase 4: Score, classify, untangle
     let scoring_start = Instant::now();
@@ -89,7 +139,7 @@ pub fn analyze_with_options(
     let mut reviews: Vec<EntityReview> = Vec::new();
     let mut dependency_edges: Vec<(String, String)> = Vec::new();
 
-    for change in &diff.changes {
+    for change in &changes {
         let dependents = graph.get_dependents(&change.entity_id);
         let dependencies = graph.get_dependencies(&change.entity_id);
         // Use capped impact count to avoid full BFS on hub entities
@@ -142,12 +192,12 @@ pub fn analyze_with_options(
         review.risk_level = score_to_level(review.risk_score);
 
         for dep in &dependencies {
-            if changed_entity_ids.contains(dep.id.as_str()) {
+            if changed_entity_ids.contains(&dep.id) {
                 dependency_edges.push((change.entity_id.clone(), dep.id.clone()));
             }
         }
         for dep in &dependents {
-            if changed_entity_ids.contains(dep.id.as_str()) {
+            if changed_entity_ids.contains(&dep.id) {
                 dependency_edges.push((change.entity_id.clone(), dep.id.clone()));
             }
         }
@@ -198,7 +248,7 @@ pub fn analyze_with_options(
         groups,
         stats,
         timing,
-        changes: diff.changes,
+        changes,
     })
 }
 

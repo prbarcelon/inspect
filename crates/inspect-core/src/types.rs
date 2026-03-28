@@ -176,3 +176,40 @@ pub struct ReviewResult {
     #[serde(skip)]
     pub changes: Vec<SemanticChange>,
 }
+
+/// An unchanged entity that is at risk of breaking due to a change in something it depends on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtRiskEntity {
+    pub entity_name: String,
+    pub entity_type: String,
+    pub file_path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub content: String,
+    pub risk_level: RiskLevel,
+    pub risk_score: f64,
+    pub own_dependent_count: usize,
+    pub is_public_api: bool,
+    pub is_cross_file: bool,
+}
+
+/// A changed entity that threatens unchanged callers/consumers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreatSource {
+    pub entity_name: String,
+    pub entity_type: String,
+    pub file_path: String,
+    pub change_type: ChangeType,
+    pub classification: ChangeClassification,
+    pub at_risk: Vec<AtRiskEntity>,
+}
+
+/// Result of blast zone prediction: unchanged code at risk of breaking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PredictResult {
+    pub threats: Vec<ThreatSource>,
+    pub total_changes: usize,
+    pub total_at_risk: usize,
+    pub at_risk_by_level: RiskBreakdown,
+    pub timing: Timing,
+}
