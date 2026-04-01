@@ -1,24 +1,32 @@
 import { NextResponse } from "next/server";
-import { getStripe } from "@/lib/stripe";
 import { getSupabase } from "@/lib/supabase";
+import crypto from "crypto";
+
+function verifySignature(payload: string, sig: string, secret: string): boolean {
+  const parts = sig.split(",").reduce((acc: Record<string, string>, part) => {
+    const [k, v] = part.split("=");
+    acc[k] = v;
+    return acc;
+  }, {});
+  const timestamp = parts["t"];
+  const expected = parts["v1"];
+  if (!timestamp || !expected) return false;
+  const signed = crypto.createHmac("sha256", secret).update(`${timestamp}.${payload}`).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(signed), Buffer.from(expected));
+}
 
 export async function POST(req: Request) {
-  const stripe = getStripe();
   const body = await req.text();
   const sig = req.headers.get("stripe-signature");
-
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
-  let event;
   if (webhookSecret && sig) {
-    try {
-      event = stripe.webhooks.constructEvent(body, sig, webhookSecret);
-    } catch {
+    if (!verifySignature(body, sig, webhookSecret)) {
       return NextResponse.json({ error: "Invalid signature" }, { status: 400 });
     }
-  } else {
-    event = JSON.parse(body);
   }
+
+  const event = JSON.parse(body);
 
   if (event.type === "checkout.session.completed") {
     const session = event.data.object;

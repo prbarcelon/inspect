@@ -1,6 +1,6 @@
 import { auth } from "@clerk/nextjs/server";
 import { NextResponse } from "next/server";
-import { getStripe } from "@/lib/stripe";
+import { createCustomer, createCheckoutSession } from "@/lib/stripe";
 import { getSupabase } from "@/lib/supabase";
 
 const CREDIT_AMOUNTS = [10_00, 25_00, 50_00, 100_00];
@@ -27,7 +27,6 @@ export async function POST(req: Request) {
   }
 
   try {
-    const stripe = getStripe();
     const supabase = getSupabase();
 
     const { data: existing } = await supabase
@@ -39,10 +38,7 @@ export async function POST(req: Request) {
     let customerId = existing?.stripe_customer_id;
 
     if (!customerId) {
-      const customer = await stripe.customers.create({
-        metadata: { clerk_user_id: userId },
-      });
-      customerId = customer.id;
+      customerId = await createCustomer({ clerk_user_id: userId });
 
       await supabase.from("credits").upsert({
         user_id: userId,
@@ -51,35 +47,24 @@ export async function POST(req: Request) {
       });
     }
 
-    const session = await stripe.checkout.sessions.create({
+    const origin = req.headers.get("origin") || "https://inspect.ataraxy-labs.com";
+
+    const url = await createCheckoutSession({
       customer: customerId,
-      mode: "payment",
-      line_items: [
-        {
-          price_data: {
-            currency: "usd",
-            unit_amount: amount,
-            product_data: {
-              name: `$${(amount / 100).toFixed(0)} inspect credits`,
-            },
-          },
-          quantity: 1,
-        },
-      ],
+      amount,
+      productName: `$${(amount / 100).toFixed(0)} inspect credits`,
       metadata: { clerk_user_id: userId, credit_cents: String(amount) },
-      success_url: `${req.headers.get("origin")}/dashboard/billing?credited=true`,
-      cancel_url: `${req.headers.get("origin")}/dashboard/billing`,
+      successUrl: `${origin}/dashboard/billing?credited=true`,
+      cancelUrl: `${origin}/dashboard/billing`,
     });
 
-    return NextResponse.json({ url: session.url });
+    if (url) {
+      return NextResponse.json({ url });
+    }
+    return NextResponse.json({ error: "Failed to create checkout session" }, { status: 500 });
   } catch (e: any) {
     return NextResponse.json(
-      {
-        error: e.message || "Stripe error",
-        type: e.type,
-        code: e.code,
-        statusCode: e.statusCode,
-      },
+      { error: e.message || "Stripe error" },
       { status: 500 }
     );
   }
