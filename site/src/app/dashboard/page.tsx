@@ -12,6 +12,13 @@ interface KeySummary {
   request_count: number;
 }
 
+const CREDIT_OPTIONS = [
+  { label: "$10", cents: 10_00 },
+  { label: "$25", cents: 25_00 },
+  { label: "$50", cents: 50_00 },
+  { label: "$100", cents: 100_00 },
+];
+
 export default function DashboardPage() {
   const [keys, setKeys] = useState<KeySummary[]>([]);
   const [loading, setLoading] = useState(true);
@@ -20,6 +27,8 @@ export default function DashboardPage() {
   const [creating, setCreating] = useState(false);
   const [copied, setCopied] = useState(false);
   const [copiedCmd, setCopiedCmd] = useState(false);
+  const [balanceCents, setBalanceCents] = useState(0);
+  const [addingCredits, setAddingCredits] = useState(false);
 
   const fetchKeys = () => {
     fetch("/api/keys")
@@ -31,8 +40,16 @@ export default function DashboardPage() {
       .catch(() => setLoading(false));
   };
 
+  const fetchBalance = () => {
+    fetch("/api/billing/balance")
+      .then((r) => r.json())
+      .then((data) => setBalanceCents(data.balance_cents || 0))
+      .catch(() => {});
+  };
+
   useEffect(() => {
     fetchKeys();
+    fetchBalance();
   }, []);
 
   const createKey = async () => {
@@ -65,6 +82,23 @@ export default function DashboardPage() {
       navigator.clipboard.writeText(createdKey);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  const addCredits = async (cents: number) => {
+    setAddingCredits(true);
+    try {
+      const res = await fetch("/api/billing/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ amount: cents }),
+      });
+      const data = await res.json();
+      if (data.url) {
+        window.location.href = data.url;
+      }
+    } finally {
+      setAddingCredits(false);
     }
   };
 
@@ -140,7 +174,51 @@ export default function DashboardPage() {
               </div>
               <div className="stat-label">last activity</div>
             </div>
+
+            <Link
+              href="/dashboard/billing"
+              className="stat-card"
+              style={{ borderColor: balanceCents > 0 ? "var(--green)" : "var(--red)", textDecoration: "none" }}
+            >
+              <div className="stat-value" style={{ color: balanceCents > 0 ? "var(--green)" : "var(--red)" }}>
+                ${(balanceCents / 100).toFixed(2)}
+              </div>
+              <div className="stat-label">credit balance</div>
+            </Link>
           </div>
+
+          {/* Add credits */}
+          <section style={{ borderTop: "1px solid var(--border)", paddingTop: 32 }}>
+            <h2 style={{ fontSize: 18, fontWeight: 600, color: "var(--accent)", margin: 0, marginBottom: 16 }}>
+              Add credits
+            </h2>
+            <p style={{ fontSize: 13, color: "var(--dim)", marginBottom: 16 }}>
+              Pay-as-you-go. Credits are deducted based on token usage.
+            </p>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              {CREDIT_OPTIONS.map((opt) => (
+                <button
+                  key={opt.cents}
+                  onClick={() => addCredits(opt.cents)}
+                  disabled={addingCredits}
+                  style={{
+                    padding: "10px 24px",
+                    background: "var(--surface)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 6,
+                    color: "var(--accent)",
+                    fontSize: 14,
+                    fontWeight: 600,
+                    fontFamily: "var(--mono)",
+                    cursor: addingCredits ? "default" : "pointer",
+                    opacity: addingCredits ? 0.4 : 1,
+                  }}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </section>
 
           {/* Create key */}
           <section style={{ borderTop: "1px solid var(--border)", paddingTop: 32 }}>

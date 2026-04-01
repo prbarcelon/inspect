@@ -1,6 +1,7 @@
 export const dynamic = "force-dynamic";
 
 import Nav from "@/components/nav";
+import DashboardNav from "@/components/dashboard-nav";
 
 export default function DashboardLayout({
   children,
@@ -11,6 +12,7 @@ export default function DashboardLayout({
     <div className="container">
       <Nav active="dashboard" />
       <div style={{ padding: "48px 0 12px" }}>
+        <DashboardNav />
         {children}
       </div>
       <footer>

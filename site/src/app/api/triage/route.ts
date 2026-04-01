@@ -1,10 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
 import { fetchPr, isNoiseFile } from "@/lib/github";
 import { validateApiKey } from "@/lib/validate-key";
+import { checkBalance } from "@/lib/credits";
 
 export async function POST(req: NextRequest) {
   const keyResult = await validateApiKey(req);
   if (!keyResult.valid) return keyResult.response;
+
+  const balance = await checkBalance(keyResult.userId);
+  if (balance <= 0) {
+    return NextResponse.json(
+      { error: "Insufficient credits. Add credits at https://inspect.ataraxy-labs.com/dashboard" },
+      { status: 402 }
+    );
+  }
 
   const githubToken = process.env.GITHUB_TOKEN;
 

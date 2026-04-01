@@ -173,7 +173,7 @@ td.mid { color: var(--yellow); }
 .cmd-doc-flags .flag span { color: var(--dim); }
 
 /* Stat cards */
-.stat-cards { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 32px; }
+.stat-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 32px; }
 .stat-card {
   padding: 20px; border: 1px solid var(--border); border-radius: 8px;
   text-align: center;
