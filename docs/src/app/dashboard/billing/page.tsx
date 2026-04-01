@@ -22,6 +22,7 @@ export default function BillingPage() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [loading, setLoading] = useState(true);
   const [addingCredits, setAddingCredits] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     Promise.all([
@@ -38,6 +39,7 @@ export default function BillingPage() {
 
   const addCredits = async (cents: number) => {
     setAddingCredits(true);
+    setError(null);
     try {
       const res = await fetch("/api/billing/checkout", {
         method: "POST",
@@ -47,7 +49,11 @@ export default function BillingPage() {
       const data = await res.json();
       if (data.url) {
         window.location.href = data.url;
+      } else {
+        setError(data.error || "Failed to create checkout session");
       }
+    } catch (e: any) {
+      setError(e.message || "Network error");
     } finally {
       setAddingCredits(false);
     }
@@ -125,6 +131,11 @@ export default function BillingPage() {
             >
               Add credits
             </p>
+            {error && (
+              <p style={{ color: "var(--red)", fontSize: 12, marginBottom: 12 }}>
+                {error}
+              </p>
+            )}
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
               {CREDIT_OPTIONS.map((opt) => (
                 <button
