@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
 
 interface ApiKey {
@@ -192,6 +193,25 @@ export default function UsagePage() {
             }}
           >
             Pricing: ${INPUT_PRICE.toFixed(2)}/M input tokens, ${OUTPUT_PRICE.toFixed(2)}/M output tokens (gpt-5.2)
+          </div>
+
+          <div style={{ marginBottom: 40 }}>
+            <Link
+              href="/dashboard/billing"
+              style={{
+                display: "inline-block",
+                padding: "10px 24px",
+                background: "var(--accent)",
+                color: "var(--bg)",
+                borderRadius: 6,
+                fontSize: 13,
+                fontWeight: 600,
+                fontFamily: "var(--mono)",
+                textDecoration: "none",
+              }}
+            >
+              Add credits
+            </Link>
           </div>
 
           {/* Per-key table */}
