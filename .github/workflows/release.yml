@@ -19,9 +19,11 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             binary: inspect-linux-aarch64
+            cross: true
           - target: x86_64-apple-darwin
             runner: macos-latest
             binary: inspect-macos-x86_64
+            cross: true
           - target: aarch64-apple-darwin
             runner: macos-latest
             binary: inspect-macos-aarch64
@@ -47,7 +49,7 @@ jobs:
       - name: Build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }} -p inspect-cli ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '--features vendored-openssl' || '' }}
+        run: cargo build --release --target ${{ matrix.target }} -p inspect-cli ${{ matrix.cross && '--features vendored-openssl' || '' }}
 
       - name: Rename binary (Unix)
         if: runner.os != 'Windows'
