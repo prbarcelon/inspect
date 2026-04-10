@@ -19,6 +19,9 @@ pub struct AppState {
     pub anthropic_model: String,
     pub supabase_url: String,
     pub supabase_key: String,
+    pub github_app_id: Option<u64>,
+    pub github_app_private_key: Option<String>,
+    pub github_webhook_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

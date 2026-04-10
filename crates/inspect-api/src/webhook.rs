@@ -397,7 +397,6 @@ async fn run_webhook_review(
         base_sha: pr.base_sha.clone(),
         head_sha: pr.head_sha.clone(),
         pr_title: pr.title.clone(),
-        diff: diff.clone(),
         triage_section: triage_section.clone(),
     };
     let (findings, agent_iters, agent_calls) =
@@ -421,7 +420,6 @@ async fn run_webhook_review(
 
     for finding in &findings {
         if let Some(ref file_path) = finding.file {
-            // Find the matching PR file
             let pr_file = pr_with_patches
                 .files
                 .iter()
@@ -436,29 +434,8 @@ async fn run_webhook_review(
                 continue;
             }
 
-            // Determine the comment line range
-            let (start_line, end_line) = if let (Some(sl), Some(el)) =
-                (finding.start_line, finding.end_line)
-            {
-                // Clamp to valid commentable lines
-                let clamped_start = valid_lines
-                    .iter()
-                    .find(|&&l| l >= sl)
-                    .copied()
-                    .unwrap_or(valid_lines[valid_lines.len() - 1]);
-                let clamped_end = valid_lines
-                    .iter()
-                    .rev()
-                    .find(|&&l| l <= el)
-                    .copied()
-                    .unwrap_or(clamped_start);
-                (clamped_start, clamped_end.max(clamped_start))
-            } else {
-                // Fallback: first commentable line
-                (valid_lines[0], valid_lines[0])
-            };
+            let line = valid_lines[0];
 
-            // Build comment body
             let severity_badge = match finding.severity.as_deref() {
                 Some("critical") => "**[Critical]**",
                 Some("high") => "**[High]**",
@@ -471,23 +448,11 @@ async fn run_webhook_review(
                 body.push_str(&format!("\n\n> {}", evidence));
             }
 
-            // Add suggestion block if the LLM provided a fix
-            if let Some(ref suggestion) = finding.suggestion {
-                body.push_str(&format!(
-                    "\n\n```suggestion\n{}\n```",
-                    suggestion
-                ));
-            }
-
             inline_comments.push(ReviewCommentInput {
                 path: pr_file.filename.clone(),
-                line: end_line,
+                line,
                 body,
-                start_line: if start_line < end_line {
-                    Some(start_line)
-                } else {
-                    None
-                },
+                start_line: None,
             });
         }
     }

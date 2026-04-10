@@ -305,6 +305,34 @@ impl GitHubClient {
         })
     }
 
+    pub fn with_token(token: &str) -> Result<Self, GitHubError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|e| GitHubError::Auth(e.to_string()))?,
+        );
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/vnd.github+json"),
+        );
+        headers.insert(USER_AGENT, HeaderValue::from_static("inspect/0.1"));
+        headers.insert(
+            "X-GitHub-Api-Version",
+            HeaderValue::from_static("2022-11-28"),
+        );
+
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .map_err(|e| GitHubError::Api(e.to_string()))?;
+
+        Ok(Self {
+            http,
+            base_url: "https://api.github.com".to_string(),
+        })
+    }
+
     fn token_from_gh_cli() -> Result<String, String> {
         let output = std::process::Command::new("gh")
             .args(["auth", "token"])
